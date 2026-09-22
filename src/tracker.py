@@ -34,7 +34,10 @@ import threading
 import time
 from collections import deque
 
+from . import handplane
 from . import mp_backend
+from . import pose_engines
+from . import pose_metrics
 from .one_euro import OneEuroScalar
 
 _cv2 = None
@@ -204,7 +207,8 @@ class PoseFrame:
                  "pose_present", "left_present", "right_present",
                  "annotated_rgba", "sides_info", "depth_info", "hand_depth",
                  "hand_quality", "pose_image", "cam_model", "body_lengths",
-                 "pose_observed", "solver_info", "pose_lifted_cam")
+                 "pose_observed", "solver_info", "pose_lifted_cam",
+                 "joint_angles")
 
     def __init__(self):
         self.timestamp = 0.0
@@ -249,6 +253,11 @@ class PoseFrame:
         # of this are the same rigid body seen twice, which is what the rig
         # calibrator aligns to find where the cameras stand.
         self.pose_lifted_cam = {}
+        # Joint angles for this frame (see `pose_metrics`). Degrees are the
+        # terms the rig is posed in, so they are the readout that says
+        # whether a change of engine improved the body form or only the
+        # landmark numbers.
+        self.joint_angles = None
 
 
 class _SideResolver:
@@ -440,10 +449,21 @@ class _HandDepth:
 
 class _DepthLifter:
     """Lift 2D pose landmarks to 3D camera coordinates using a pinhole model
-    and known limb lengths."""
+    and known limb lengths.
 
-    def __init__(self, hfov_deg):
+    The lengths are normally learned from the engine's own metric world
+    pose. A 2D engine has none, so without measured values every user
+    would be lifted as the same average person — which is why `overrides`
+    exists: a tape measure beats both a learned estimate and a population
+    average, and it is the only source of real proportions the 2D engines
+    have. Any override left at 0 keeps the learned-or-default behaviour.
+    """
+
+    def __init__(self, hfov_deg, overrides=None):
         self.hfov = math.radians(max(20.0, min(170.0, hfov_deg)))
+        ov = overrides or {}
+        self._fixed = {k: float(ov.get(k) or 0.0)
+                       for k in ("shoulder", "upper", "fore")}
         self._shoulder = deque(maxlen=150)
         self._upper = deque(maxlen=150)
         self._fore = deque(maxlen=150)
@@ -476,16 +496,28 @@ class _DepthLifter:
                 self._fore.append(dist(el, wr))
 
     def shoulder_width(self):
+        if self._fixed["shoulder"] > 0.0:
+            return self._fixed["shoulder"]
         m = _percentile(self._shoulder, 0.5)
         return m if (m and m > 0.15) else _DEFAULT_SHOULDER_WIDTH
 
     def upper_len(self):
+        if self._fixed["upper"] > 0.0:
+            return self._fixed["upper"]
         m = _percentile(self._upper, 0.8)
         return m if (m and m > 0.12) else _DEFAULT_UPPER_ARM
 
     def fore_len(self):
+        if self._fixed["fore"] > 0.0:
+            return self._fixed["fore"]
         m = _percentile(self._fore, 0.8)
         return m if (m and m > 0.12) else _DEFAULT_FOREARM
+
+    def lengths_measured(self):
+        """True when these lengths came from this user rather than a table."""
+        if all(v > 0.0 for v in self._fixed.values()):
+            return True
+        return bool(self._shoulder and self._upper and self._fore)
 
     # --- geometry -----------------------------------------------------------
     def _ray(self, u, v, W, H, f_px):
@@ -641,10 +673,26 @@ class WebcamTracker:
                  hand_size_auto=True, record_path=None,
                  target_fps=0, use_mjpg=True, exposure_mode="AUTO",
                  exposure=-6.0, gain=-1.0, infer_width=0, pose_every=1,
-                 parallel_infer=True, preview_fps=12.0, delegate="CPU"):
+                 parallel_infer=True, preview_fps=12.0, delegate="CPU",
+                 pose_engine="MEDIAPIPE", engine_quality="BALANCED",
+                 engine_layout="BODY", engine_hands="AUTO",
+                 engine_device="CPU", engine_det_every=6,
+                 engine_kpt_thr=0.3, engine_hand_detector=True,
+                 body_shoulder=0.0, body_upper=0.0, body_fore=0.0):
         self.camera_index = camera_index
         self.mirror = mirror
         self.model_complexity = model_complexity
+        # --- pose engine selection ---
+        self.pose_engine = (pose_engine or "MEDIAPIPE").upper()
+        self.engine_quality = (engine_quality or "BALANCED").upper()
+        self.engine_layout = (engine_layout or "BODY").upper()
+        self.engine_hands = (engine_hands or "AUTO").upper()
+        self.engine_device = (engine_device or "CPU").upper()
+        self.engine_det_every = max(1, int(engine_det_every or 1))
+        self.engine_kpt_thr = float(engine_kpt_thr)
+        self.engine_hand_detector = bool(engine_hand_detector)
+        self._caps = pose_engines.capabilities(self.pose_engine)
+        self._engine_info = ""
         self.show_window = show_window
         self.preview_width = preview_width
         self.tracking_mode = tracking_mode
@@ -684,8 +732,17 @@ class WebcamTracker:
         self._sx = (1.0 if mirror else -1.0) * (1.0 if selfie else -1.0)
         self._sdepth = -1.0 if selfie else 1.0
         self._sides = _SideResolver(_user_left_is_image_left(self.view_mode, mirror))
-        self._lifter = _DepthLifter(camera_fov)
+        self._lifter = _DepthLifter(camera_fov, {
+            "shoulder": body_shoulder, "upper": body_upper,
+            "fore": body_fore,
+        })
         self._hand_depth = _HandDepth(hand_size=hand_size, auto_scale=hand_size_auto)
+        # Depth for engines whose hand landmarks are 2D only; see handplane.
+        self._palm_planes = handplane.PalmPlanes()
+        # Depth direction of each forearm from the previous frame, which
+        # is what tells a flat palm which way it is tilted. Last frame's
+        # is used because this frame's lift needs the hands first.
+        self._arm_hint = {}
 
         self._thread = None
         self._grab_thread = None
@@ -767,6 +824,10 @@ class WebcamTracker:
             return 0.0
         return (len(self._fps_samples) - 1) / span
 
+    def engine_info(self):
+        """Which models this run actually loaded, for the panel."""
+        return self._engine_info
+
     def hand_scale(self):
         """(effective hand-size scale, learned ratio or None)."""
         return self._hand_depth.scale(), self._hand_depth.auto_ratio()
@@ -782,6 +843,10 @@ class WebcamTracker:
             header = {"kind": "header", "mirror": bool(self.mirror),
                       "view_mode": self.view_mode, "camera_fov": math.degrees(self._lifter.hfov),
                       "tracking_mode": self.tracking_mode, "model_complexity": self.model_complexity,
+                      "pose_engine": self.pose_engine,
+                      "engine_quality": self.engine_quality,
+                      "engine_layout": self.engine_layout,
+                      "engine_hands": self.engine_hands,
                       "pose_visibility": self.pose_visibility, "lift_depth": self.lift_depth,
                       "hand_depth": self.use_hand_depth, "hand_size": self._hand_depth.hand_size,
                       "hand_size_auto": self._hand_depth.auto_scale}
@@ -1289,6 +1354,14 @@ class WebcamTracker:
         two landmarkers hold separate tracking state and only read the
         frame, so sharing it between them is safe.
         """
+        # A ROI hand model needs to know where the body thinks the hands
+        # are. With the two running in parallel these boxes are one frame
+        # old, which at webcam rates moves a wrist by a few percent of its
+        # own crop — far less than the crop's padding, and it buys back the
+        # entire cost of a second detector.
+        if hand_backend is not None and hasattr(hand_backend, "set_body"):
+            hand_backend.set_body(pose_backend, self._last_pose_res)
+
         def run_hands():
             if hand_backend is None:
                 return mp_backend.HandsResult()
@@ -1357,6 +1430,26 @@ class WebcamTracker:
                     0.5, (0, 220, 255), 2, cv2.LINE_AA)
         return overlay
 
+    # --- offline reuse ------------------------------------------------
+
+    # A recorded clip has to be turned into PoseFrames by exactly the same
+    # maths a live camera is, or a take baked from footage and one baked
+    # from the webcam would disagree about depth, sides and hand scale.
+    # These three are that seam: `offline` builds a tracker it never
+    # starts, purely to call them.
+
+    def build_pose_frame(self, res, pose_res, W, H, t):
+        """Assemble a PoseFrame from raw backend results off any source."""
+        return self._build_frame(res, pose_res, W, H, t)
+
+    def draw_pose_overlay(self, img, pose_res, w, h):
+        """Draw body landmarks onto a BGR frame, in place."""
+        self._draw_pose(img, pose_res, w, h)
+
+    def draw_hand_overlay(self, img, res):
+        """Draw hand landmarks onto a BGR frame, in place."""
+        self._draw_hands(img, res)
+
     # --- per-frame assembly ------------------------------------------------
 
     def _build_frame(self, res, pose_res, W, H, t):
@@ -1412,7 +1505,13 @@ class WebcamTracker:
         for side, track in zip(sides, res.hands):
             if not track.landmarks:
                 continue
-            wrist = track.landmarks[HAND_WRIST]
+            # RTMPose and ViTPose hands are pixels with no depth at all,
+            # which gives the retargeter a palm whose normal is stuck on
+            # the camera axis. Fitting the palm plane puts a usable depth
+            # back; a MediaPipe hand already has one and is left alone.
+            landmarks = self._palm_planes.lift(side, track.landmarks, aspect,
+                                               self._arm_hint.get(side, 0.0))
+            wrist = landmarks[HAND_WRIST]
             hand_wrists_img[side] = (wrist[0], wrist[1])
             if self.use_hand_depth:
                 wr_cam = self._hand_depth.wrist(side, track.landmarks,
@@ -1423,7 +1522,7 @@ class WebcamTracker:
                     pf.hand_depth[side] = wr_cam[2]
             ref_scale = 0.18   # approximate scale so a hand ~= 0.18 m across
             hand_dict = {}
-            for i, lm in enumerate(track.landmarks):
+            for i, lm in enumerate(landmarks):
                 hand_dict[i] = self._hand_to_blender(lm, ref_scale, wrist, aspect)
             if hand_dict:
                 pf.hand_quality[side] = sum(
@@ -1448,6 +1547,16 @@ class WebcamTracker:
                     # The lift ran on the mirrored image, so its x is
                     # reflected; undo that to get the real camera's frame.
                     pf.pose_lifted_cam[i] = (flip * p[0], p[1], p[2])
+                for side, (el_i, wr_i) in (("L", (POSE_LELBOW, POSE_LWRIST)),
+                                           ("R", (POSE_RELBOW, POSE_RWRIST))):
+                    e, w = lifted.get(el_i), lifted.get(wr_i)
+                    if e is None or w is None:
+                        continue
+                    dx, dy, dz = w[0] - e[0], w[1] - e[1], w[2] - e[2]
+                    n = math.sqrt(dx * dx + dy * dy + dz * dz)
+                    # Unit depth component, so a forearm across the view
+                    # contributes nothing rather than a confident zero.
+                    self._arm_hint[side] = (dz / n) if n > 1e-6 else 0.0
                 for side, cands in self._lifter.wrist_depth_candidates.items():
                     if side in hand_depth_img:
                         self._hand_depth.add_candidates(side, cands)
@@ -1462,6 +1571,7 @@ class WebcamTracker:
         pf.sides_info = "pose%s hands[%s]" % (
             "*" if self._sides.pose_swap_score > 0 else "", side_src)
         pf.depth_info = depth_info.strip()
+        pf.joint_angles = pose_metrics.from_frame(pf, thr)
         return pf
 
     def _run(self):
@@ -1502,21 +1612,31 @@ class WebcamTracker:
         hand_backend = None
         pose_backend = None
         if self._use_hands:
-            self._state = "loading hand landmarker (first run downloads model)"
-            hand_backend = mp_backend.HandsBackend(max_hands=2, running_mode="VIDEO",
-                                                   delegate=self.delegate)
+            self._state = ("loading %s hand model (first run downloads it)"
+                           % self.pose_engine.lower())
+            hand_backend = pose_engines.make_hands_backend(
+                self.pose_engine, hand_source=self.engine_hands,
+                body_layout=self.engine_layout, max_hands=2,
+                running_mode="VIDEO", delegate=self.delegate,
+                device=self.engine_device, kpt_thr=self.engine_kpt_thr,
+                hand_detector=self.engine_hand_detector,
+            )
             try:
                 hand_backend.load()
             except Exception as e:
                 self._error = str(e)
-                self._state = "hand landmarker init failed"
+                self._state = "hand model init failed"
                 cap.release()
                 return
         if self._use_pose:
-            self._state = "loading pose landmarker (first run downloads model)"
-            pose_backend = mp_backend.PoseBackend(
-                model_complexity=self.model_complexity, running_mode="VIDEO",
-                delegate=self.delegate,
+            self._state = ("loading %s body model (first run downloads it)"
+                           % self.pose_engine.lower())
+            pose_backend = pose_engines.make_pose_backend(
+                self.pose_engine, model_complexity=self.model_complexity,
+                running_mode="VIDEO", delegate=self.delegate,
+                quality=self.engine_quality, body_layout=self.engine_layout,
+                device=self.engine_device, det_every=self.engine_det_every,
+                kpt_thr=self.engine_kpt_thr,
             )
             try:
                 pose_backend.load()
@@ -1526,6 +1646,12 @@ class WebcamTracker:
                 pose_backend = None
 
         which_str = ",".join([b.which() for b in (hand_backend, pose_backend) if b])
+        if pose_backend is not None and not self._caps.world_pose \
+                and not self._lifter.lengths_measured():
+            # A 2D engine cannot measure the user, so unless they typed
+            # their own lengths the lift is scaling an average body.
+            which_str += " [generic limb lengths]"
+        self._engine_info = which_str
         self._state = "waiting for first frame (backend=%s)" % which_str
         self._record_open()
         window_name = "FPV Pose Tracker (press Q here to close)"
@@ -1564,7 +1690,12 @@ class WebcamTracker:
                 # Landmarks come back normalised, so a downscaled inference
                 # image produces identical coordinates and the depth maths
                 # (which works off the real frame width) is unaffected.
-                if self.infer_width and W > self.infer_width:
+                # A top-down engine crops and rescales to its own input
+                # size, so shrinking the frame first saves it nothing and
+                # costs the hand crops the resolution they exist to get.
+                if self._caps.wants_full_frame:
+                    infer_bgr = frame
+                elif self.infer_width and W > self.infer_width:
                     iw = self.infer_width
                     ih = max(1, int(H * iw / W))
                     infer_bgr = cv2.resize(frame, (iw, ih), interpolation=cv2.INTER_AREA)
@@ -1668,12 +1799,23 @@ class WebcamTracker:
             (POSE_RELBOW, POSE_RWRIST),
         ]
         pts = [(int(lm[0] * w), int(lm[1] * h)) for lm in pose_res.image_landmarks]
+        vis = pose_res.visibility
+
+        def seen(i):
+            # A 2D engine reports an unconfident joint as visibility 0 with
+            # no position at all, so drawing it would fire a bone at the
+            # top-left corner. MediaPipe always has a position, and passes
+            # this test on any threshold it reports.
+            if i >= len(pts):
+                return False
+            return (i >= len(vis)) or vis[i] > 0.0
+
         for a, b in conns:
-            if a < len(pts) and b < len(pts):
+            if seen(a) and seen(b):
                 cv2.line(img, pts[a], pts[b], (255, 128, 0), 2, cv2.LINE_AA)
         for i in (POSE_LSHOULDER, POSE_RSHOULDER, POSE_LELBOW, POSE_RELBOW,
                   POSE_LWRIST, POSE_RWRIST):
-            if i < len(pts):
+            if seen(i):
                 cv2.circle(img, pts[i], 4, (255, 255, 0), -1, cv2.LINE_AA)
 
     def _draw_hands(self, img, res):
@@ -1699,9 +1841,17 @@ class WebcamTracker:
                 cv2.circle(img, p, 3, (0, 0, 255), -1, cv2.LINE_AA)
 
 
-def test_webcam(camera_index=0, tracking_mode="HANDS", mirror=True):
-    """Synchronous single-frame test. Returns (ok, human_report_string)."""
-    lines = [mp_backend.diagnostics(), ""]
+def test_webcam(camera_index=0, tracking_mode="HANDS", mirror=True,
+                pose_engine="MEDIAPIPE", engine_quality="BALANCED",
+                engine_layout="BODY", engine_hands="AUTO",
+                engine_device="CPU", engine_kpt_thr=0.3):
+    """Synchronous single-frame test. Returns (ok, human_report_string).
+
+    Runs the engine the user has selected, not a fixed one: "does my
+    webcam work" and "can this machine run ViTPose" are the same question
+    at the point where either answer stops the session starting.
+    """
+    lines = [pose_engines.diagnostics(pose_engine), ""]
     try:
         import cv2
     except Exception as e:
@@ -1739,27 +1889,73 @@ def test_webcam(camera_index=0, tracking_mode="HANDS", mirror=True):
         frame = cv2.flip(frame, 1)
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    lines.append("Loading hand landmarker...")
-    backend = mp_backend.HandsBackend(max_hands=2, min_detection=0.3, min_tracking=0.3)
-    try:
-        backend.load()
-    except Exception as e:
-        cap.release()
-        return False, "\n".join(lines + ["ERROR: " + str(e)])
-    lines.append("  backend: %s" % backend.which())
+    mode = (tracking_mode or "HANDS").upper()
+    want_pose = mode in ("POSE", "HOLISTIC")
+    want_hands = mode in ("HANDS", "HOLISTIC")
+    pose_backend = None
+    hand_backend = None
+    pose_res = None
 
-    try:
-        res = backend.process(rgb)
-    except Exception as e:
-        backend.close()
-        cap.release()
-        return False, "\n".join(lines + ["ERROR during process(): %s" % e])
+    if want_pose:
+        lines.append("Loading %s body model (first run downloads it)..."
+                     % pose_engine.lower())
+        pose_backend = pose_engines.make_pose_backend(
+            pose_engine, min_detection=0.3, min_tracking=0.3,
+            quality=engine_quality, body_layout=engine_layout,
+            device=engine_device, kpt_thr=engine_kpt_thr,
+        )
+        try:
+            pose_backend.load()
+            lines.append("  backend: %s" % pose_backend.which())
+            pose_res = pose_backend.process(rgb)
+        except Exception as e:
+            cap.release()
+            return False, "\n".join(lines + ["ERROR (body): %s" % e])
+        if pose_res.present:
+            seen = sum(1 for v in pose_res.visibility if v > 0.0)
+            lines.append("Pose: %d/%d landmarks seen, world pose: %s"
+                         % (seen, len(pose_res.visibility),
+                            "yes" if pose_res.landmarks else "no (2D engine)"))
+            ang = pose_metrics.compute(pose_res.image_landmarks,
+                                       pose_res.visibility, 0.01, space="2d")
+            if ang.summary():
+                lines.append("  angles: " + ang.summary())
+        else:
+            lines.append("Pose: nobody found in this frame")
 
-    lines.append("Detected hands: %d" % len(res.hands))
-    for t in res.hands:
-        lines.append("  %s hand: %d landmarks" % (t.label, len(t.landmarks)))
+    if want_hands:
+        lines.append("Loading hand model...")
+        hand_backend = pose_engines.make_hands_backend(
+            pose_engine, hand_source=engine_hands, body_layout=engine_layout,
+            max_hands=2, min_detection=0.3, min_tracking=0.3,
+            device=engine_device, kpt_thr=engine_kpt_thr,
+        )
+        try:
+            hand_backend.load()
+        except Exception as e:
+            if pose_backend is not None:
+                pose_backend.close()
+            cap.release()
+            return False, "\n".join(lines + ["ERROR (hands): %s" % e])
+        lines.append("  backend: %s" % hand_backend.which())
+        if hasattr(hand_backend, "set_body"):
+            hand_backend.set_body(pose_backend, pose_res)
+        try:
+            res = hand_backend.process(rgb)
+        except Exception as e:
+            hand_backend.close()
+            if pose_backend is not None:
+                pose_backend.close()
+            cap.release()
+            return False, "\n".join(lines + ["ERROR during process(): %s" % e])
+        lines.append("Detected hands: %d" % len(res.hands))
+        for t in res.hands:
+            lines.append("  %s hand: %d landmarks" % (t.label, len(t.landmarks)))
 
-    backend.close()
+    if hand_backend is not None:
+        hand_backend.close()
+    if pose_backend is not None:
+        pose_backend.close()
     cap.release()
     return True, "\n".join(lines)
 

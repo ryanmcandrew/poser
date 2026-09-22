@@ -1,29 +1,204 @@
 # FPV Pose Tracker
 
 A Blender add-on that reads a webcam feed and drives an armature in real time
-using [MediaPipe Holistic](https://developers.google.com/mediapipe) pose and
-hand-landmark estimation. Designed for a first-person body-cam view: the
-tracked arms and hands are retargeted so they appear as the player's arms
+from 2D/3D human pose estimation. Designed for a first-person body-cam view:
+the tracked arms and hands are retargeted so they appear as the player's arms
 extending forward into the camera frame.
+
+The pose estimator is selectable -- [MediaPipe
+Holistic](https://developers.google.com/mediapipe),
+[RTMPose](https://github.com/open-mmlab/mmpose/tree/dev-1.x/projects/rtmpose)
+or [ViTPose](https://github.com/ViTAE-Transformer/ViTPose) -- see [Pose
+engines](#pose-engines).
 
 Every arm joint (shoulder, upper arm, forearm, hand) plus every finger and
 thumb joint (three phalanges per digit, both hands) is driven independently.
 
+## Pose engines
+
+The estimator is chosen in the panel's **Pose Engine** box and can be changed
+between runs (Stop -> Start). They are not interchangeable in the same way a
+quality slider is: the engines differ in what they can report, and the panel
+adapts to that.
+
+| Engine | Body | Arms / shoulders | Hands | Accuracy | Real time | 3D of its own |
+| --- | --- | --- | --- | --- | --- | --- |
+| MediaPipe Holistic | 33 landmarks | good | good | ***  | ***** | yes (metric world pose) |
+| RTMPose | 17 / 26 / 133 | excellent | excellent (dedicated model) | ****+ | ****+ | no |
+| ViTPose | 17 / 25 / 133 | excellent | excellent (dedicated model) | ***** | ** to *** | no |
+
+**MediaPipe** is the fastest by a wide margin and the only engine that reports
+a metric 3D pose itself, so it is the default and still the right choice on a
+weak machine. Its weakness is exactly the thing this add-on cares most about:
+shoulder, elbow and wrist placement.
+
+**RTMPose** is the recommended upgrade. It is a top-down stack -- a person
+detector proposes a box, a body model reads the joints out of that crop, and a
+dedicated hand model runs on a higher-resolution crop around each wrist:
+
+```
+camera -> person detector -> body pose -> wrist/elbow ROIs -> hand pose
+```
+
+This beats raising MediaPipe's *Model Complexity* because the body and the
+hands each get a model matched to their own difficulty, rather than sharing
+one budget at one resolution. It is the same principle MediaPipe's Holistic
+uses internally, with the models chosen per stage instead of fixed.
+
+**ViTPose** is the same stack with a Vision Transformer backbone: the most
+accurate body landmarks available here, and the heaviest. Sensible with a CUDA
+GPU; expect well under real time on CPU.
+
+### Engine settings
+
+- **Quality** -- Lite / Balanced / Accurate picks the model size and the
+  detector together (RTMPose-s/m/x, ViTPose-s/b/l, YOLOX-tiny/m/x).
+- **Keypoints** -- *Body (17)* is COCO-17 and covers everything the arm
+  retargeter reads. *Body + Feet (26)* adds heels and toes. *Whole Body (133)*
+  adds face and both hands from one model.
+- **Hand Source** -- where fingers come from. *RTMPose Hand (ROI)* is the best
+  option and the architecture described above. *From Body Model* reuses the
+  hand points a 133-keypoint body pass already produced: free, but limited by
+  the body crop's resolution. *MediaPipe Hands* pairs an RTMPose/ViTPose body
+  with MediaPipe's hand landmarker, which is fast and supplies the metric hand
+  geometry the depth estimate can use. *Auto* takes the body model's hands
+  when it has them and the ROI model otherwise.
+- **Detect Every** -- how often the person detector runs. The detector is the
+  expensive half of a top-down stack and a webcam subject does not teleport,
+  so in between frames the box is tracked forward from the previous frame's
+  keypoints. 5-10 costs almost nothing in accuracy.
+- **Keypoint Threshold** -- keypoints below this score are reported as unseen
+  rather than driving a bone. Raise it if the rig twitches toward guessed
+  joints; lower it to keep a partly occluded arm alive.
+- **Compute** -- CPU, CUDA or Apple CoreML. The GPU providers fall back to CPU
+  if the matching `onnxruntime` build is missing, and the panel offers an
+  **Install GPU Runtime** button that swaps in `onnxruntime-gpu`.
+
+### What changes when you leave MediaPipe
+
+RTMPose and ViTPose are **2D** estimators. Three consequences, all handled in
+the panel rather than silently:
+
+1. **Arm Depth** is forced to *2D + Limb Lengths*; there is no world pose to
+   read. This is the better path anyway (see [How it works](#how-it-works)),
+   but it means **Camera FOV** has to be roughly right.
+2. **Your Measurements** matter. The depth lift needs your shoulder width,
+   upper arm and forearm in metres. MediaPipe learns them from its own 3D
+   pose; a 2D engine cannot, so unset values fall back to an average body and
+   the panel says so (and the status line reads `[generic limb lengths]`).
+   Measuring yourself once is the single biggest accuracy win available to
+   these engines.
+3. **Hand Size Drives Depth** should be on. A 2D engine reports no per-joint
+   depth ordering at all, so the hand-size cue is the only thing that can tell
+   an arm reaching toward the camera from one reaching away.
+
+**Infer Width** is ignored for these engines: a top-down model crops and
+rescales to its own input size, so pre-shrinking the frame saves it nothing
+and only blurs the hand crops.
+
+In multi-camera mode each camera loads its own copy of the models, so the
+memory and warm-up cost scale with the number of cameras.
+
+### Hands from RTMPose and ViTPose are flat
+
+MediaPipe's hand model returns a depth for every landmark. RTMPose and
+ViTPose do not: their hand keypoints are pixel positions, and the depth
+comes back as zero. A hand whose landmarks all sit at one depth is a flat
+sheet facing the lens, and the palm normal built from it can only ever
+point along the view axis -- so the wrist can roll, but it cannot tilt or
+turn, and the normal flips sign the moment the knuckles cross over in the
+image. Switching engine for the accuracy of the body landmarks and
+finding that palm direction got *worse* is this, not a regression in the
+retargeter.
+
+The addon fits the palm plane instead. The wrist and the four knuckles
+are close enough to a rigid, flat shape that their image is a projection
+of a known template, and fitting that template recovers the plane's tilt
+-- up to the one ambiguity every planar target has, where tilting towards
+or away from the camera looks identical. That ambiguity is settled by
+continuity with the previous frame and by the forearm's own depth
+direction, since a hand roughly continues the arm it is on.
+
+What this does not recover is depth *within* the fingers: a curled finger
+is fitted as though it lay in the palm plane. Finger bones are driven
+from angles, so the cost is small, but a hand model with real depth
+(MediaPipe, or a multi-camera rig) still measures what this estimates.
+
+### Body form, not just landmarks
+
+Whether a pose is anatomically right is a question about angles, not pixels,
+and angles are also what the rig actually consumes -- a model can win on
+landmark error and still produce a jittery elbow. The status block reports,
+per frame:
+
+```
+elbow angle      angle(shoulder, elbow, wrist)
+shoulder angle   angle(elbow, shoulder, hip)     measured against the torso,
+                                                 so leaning does not change it
+torso lean       angle(shoulder_mid -> hip_mid, vertical)
+arm symmetry     |left angle - right angle|
+```
+
+They are computed from the depth lift when it is available and from image
+coordinates otherwise, and the readout says which (`[3d]` / `[2d]`) -- a 2D
+angle is a projection, so an arm swinging toward the camera barely moves it.
+`pose_metrics.py` exposes the same values for scripting.
+
 ## Build
 
-```bash
-python build.py
+```powershell
+.\scripts\runbuild.ps1
 # produces dist/fpv_pose_tracker-<version>.zip
 ```
+
+`runbuild.ps1` is the one to reach for: it finds a Python, runs the build from
+the repository root whatever directory you are standing in, and then reads the
+finished zip back to check it is actually installable. That last step matters
+because the zip's top-level folder becomes the add-on's Python package name in
+Blender, so a bad layout produces a zip that installs and then fails to
+import -- better caught here than in Blender.
+
+| Flag | Effect |
+| --- | --- |
+| `-Python <path>` | Use a specific interpreter instead of auto-detecting `py -3` / `python` / `python3`. `build.py` is standard-library only, so any Python 3 works, including Blender's own. |
+| `-Clean` | Prune older zips from `dist/`, keeping the newest `-Keep`. Lists them and asks first. |
+| `-Keep <n>` | How many zips `-Clean` leaves (default 5; `0` keeps only this build). |
+| `-Force` | Let `-Clean` skip the confirmation, for scripted use. |
+| `-WhatIf` | Show what `-Clean` would delete without deleting it. |
+| `-SkipVerify` | Build without inspecting the zip. |
+| `-Reveal` | Open `dist/` in Explorer on success. |
+
+`dist/` is gitignored, so the zips in it are the only copies of past releases
+that exist -- git cannot restore them and an older version cannot be rebuilt
+from current source. That is why `-Clean` keeps several by default and asks
+before deleting.
+
+`python build.py` still works on its own if you would rather not go through
+PowerShell; it must be run from the repository root.
 
 ## Install
 
 1. In Blender: `Edit > Preferences > Add-ons > Install...`, pick the zip.
 2. Enable **FPV Pose Tracker**.
 3. On first use the panel will show an **Install Dependencies** button that
-   pip-installs `opencv-python`, `mediapipe`, and `numpy` into Blender's
-   bundled Python. Blender may need to be run as admin the first time on
-   Windows. Restart Blender afterwards if imports still fail.
+   pip-installs what the selected engine needs (`opencv-python` and `numpy`
+   always; `mediapipe` for the MediaPipe engine; `rtmlib` and `onnxruntime`
+   for RTMPose/ViTPose). No restart and no admin rights are needed: the
+   wheels go into `scripts/fpv_pose_tracker_wheels` under your Blender
+   config directory, which the add-on puts on `sys.path` at registration,
+   and the installer re-imports each module before it reports success.
+4. `Edit > Preferences > Add-ons > FPV Pose Tracker` lists every engine with
+   its own Install button, so you can add an engine later without reinstalling
+   the add-on. Model checkpoints download on first use, not at install time.
+
+Wheels live outside the add-on folder on purpose, so reinstalling the zip does
+not throw away a few hundred megabytes of downloads. If an engine reports a
+module missing that you know you installed, hit **Engine Info**: it prints the
+directory each module resolved from and every directory searched. The usual
+cause is a `pip install --user` from outside Blender -- Blender embeds Python
+with the per-user `site-packages` disabled, so wheels installed there are
+invisible to it. The add-on searches that directory too, for exactly this
+reason.
 
 Blender 4.2+ also supports dragging the zip directly onto a 3D Viewport.
 
@@ -400,10 +575,164 @@ frame rate on save, so the take keeps its real-time pacing. Quaternions are
 put on a consistent hemisphere between keys, so no joint takes the long way
 round between two frames.
 
+## Clip library and offline pose estimation
+
+Live tracking has one budget: whatever is left of a frame interval after
+Blender has drawn. That budget is what picks the model, and it is why
+ViTPose is not really a live option. Recording the performance as plain
+video first and estimating pose afterwards removes the budget, which buys
+three separate things: the accurate model, every frame in order with none
+dropped, and the current frame's body pose placing the hand crops instead
+of the previous frame's.
+
+Everything below is in the **Clip Library + Offline Pose** panel in the
+sidebar, and none of it needs tracking mode.
+
+### Where clips live
+
+Clips are files in a two-level folder tree:
+
+```
+<library>/<category>/<subgroup>/<name>.mp4          the footage
+<library>/<category>/<subgroup>/<name>.timing.json  per-frame capture times
+<library>/<category>/<subgroup>/<name>.RTMPOSE.pose.json.gz   one analysis
+```
+
+**Library** is the root; leave it blank and clips go to a `clips` folder
+inside the addon. **Category** and **Subgroup** are plain folders -- pick
+an existing one from the dropdown or type a new name, and it is created on
+the next recording. Because they are only folders, rearranging takes in
+Explorer works; press **Refresh Library** afterwards. **Whole Library**
+lists everything rather than just the selected category.
+
+### Recording a clip
+
+Set **Clip Name**, **Countdown** (seconds of preview before capture starts,
+to get out of reach of the keyboard) and **Max Length**, then press
+**Record Clip**. Resolution, frame rate, MJPG and exposure come from
+*Capture + Performance* in the main panel, and the advice there about short
+exposures for fast motion applies with more force here: this is the only
+image the accurate pass will ever see.
+
+No pose model runs during capture, on purpose -- inference would cost frame
+rate and add motion blur to the very footage the accurate pass exists to
+read. A name collision appends a number rather than overwriting footage you
+cannot re-shoot.
+
+A webcam does not deliver frames at the rate it claims and a container
+stores only one nominal rate, so the wall-clock time of every written frame
+goes into the `.timing.json` beside the clip, and a take baked from it runs
+at the speed it was performed at.
+
+**Play in Player** hands the selected clip to whatever the desktop opens
+video with, which is the quickest way to check the footage itself before
+spending model time on it. The in-panel preview holds the file open while
+it is showing, so this closes it first.
+
+### Analysing a clip
+
+Select a clip and choose an **Engine**, **Quality** and **Compute** -- these
+are separate from the live settings, so live tracking can stay on MediaPipe
+while clips are analysed with ViTPose-large on the GPU. **Every Nth Frame**
+trades temporal detail for time on a long clip; 1 is the point of an offline
+pass. **Replace Existing** guards a previous long run.
+
+**Analyze Clip** runs in the background and reports progress; Blender stays
+usable. The result is written beside the clip as one gzipped file per
+engine, so the same footage can be run through MediaPipe, RTMPose and
+ViTPose and the three compared directly -- the clip list shows which engines
+each clip has, and the **Result** dropdown shows each one's detection rate
+and cost per frame.
+
+What is stored is raw landmarks, not bone rotations. Estimation is the
+expensive fixed part; retargeting is cheap and depends on things that change
+constantly (armature, limb lengths, smoothing, FOV, IK), so a clip is
+analysed once per engine and replayed as often as the rig changes.
+
+### Previewing the result
+
+**Show Pose Preview** draws the stored landmarks over the footage at the
+scrub position, in the panel. Step a frame at a time, jump to the ends, or
+use **Next Gap** to jump to the next frame where the body was not detected
+-- a lost stretch is what makes a take unusable and finding it by dragging a
+slider over 2000 frames is hopeless. **Body** and **Hands** toggle each
+overlay. What is drawn is exactly what would drive the rig, because it comes
+out of the same file the replay reads.
+
+### Calibration: what the rest pose looked like
+
+Hand and wrist bones are not driven by the palm's absolute orientation.
+They are driven by how far the palm has turned **since a reference pose**
+-- the moment the performer stood in the rig's rest pose. Live tracking
+gets that for free by asking the user to hold still for three seconds
+before it starts driving anything.
+
+A recorded clip cannot be asked anything. Its first frames are whatever
+the take happens to open on, and calibrating off them declares mid-punch
+to be the rest pose, which rotates every wrist in the resulting take by
+however wrong that guess was. This is the single biggest cause of an
+offline take looking worse than live tracking of the same motion.
+
+So the **Calibration** box says where the reference comes from:
+
+* **Saved Profile** -- a calibration recorded once and kept in the
+  library. The reliable option.
+* **Live Session** -- reuse the calibration from the live tracker in this
+  Blender session, which is available as soon as you have tracked once.
+  **Save Live Calibration** writes it to the library as a profile.
+* **This Clip's Opening** -- sample from the first seconds of this clip.
+  Correct only when the clip itself opens on the rest pose.
+
+**Making a calibration clip.** Press **Record Calibration Clip**: it
+shoots into a `calibration` category with a long countdown and a six
+second limit, so there is time to get back from the keyboard. Hold the
+rig's rest pose: facing the camera, arms and hands where the armature's
+arms and hands are, palms and fingers pointing the way the rig's do.
+Then analyse it with the engine you intend to use for real takes, select
+it, and press **Calibrate from Clip**.
+**Skip** ignores the first moment while you settle, **Hold** limits how
+much of the clip is sampled, and **Save As** names the profile.
+
+One profile covers every clip shot in the same setup: it describes the
+performer and the camera, not the scene, so it lives in the library
+(`_calibration/<name>.json`) rather than in the .blend, and it can prime
+any rig. Record a new one when the camera moves, when someone else
+performs, or when the rig's rest pose changes.
+
+Calibrating from a clip also produces a profile you can hand to someone
+else along with the footage, which is the point of keeping it as a file.
+
+### Driving the rig from a clip
+
+**Apply to Rig** replays the analysis through the same retargeter live
+tracking uses and records it as a take. No camera is opened and nothing is
+in tracking mode. The take then goes through the ordinary review editor --
+trim, outlier detection, per-sample keep/drop -- and **Save to Action**
+bakes it, so recorded footage gets exactly the cleanup tools a live
+recording gets. **Bake Straight to an Action** skips the review step for a
+clip that needs no cleanup.
+
+**Play on Rig** sets the scene range to the rig's current action and plays
+it, which is the whole point of the offline path: a recorded performance
+plays back on the model with nothing running.
+
+Applying needs an armature, a bone map (**Auto-Map**), no live tracker
+holding the rig, and a calibration source that actually exists; the panel
+says so when one is missing, and **Apply to Rig** refuses rather than
+calibrating off the performance behind your back.
+
 ## How it works
 
-- A worker thread reads frames from OpenCV (`cv2.VideoCapture`) and runs
-  MediaPipe pose + hand landmarkers on each frame.
+- A worker thread reads frames from OpenCV (`cv2.VideoCapture`) and runs the
+  selected engine's body + hand models on each frame.
+- **Every engine reports into one schema** (`pose_schema.py`): MediaPipe's
+  33-point pose order. COCO-17, Halpe-26, COCO-25 and COCO-WholeBody-133 are
+  lookup-table conversions into those slots, with unmapped joints reported as
+  visibility 0 -- which is already how the pipeline spells "not measured".
+  Hand landmarks need no conversion: MMPose numbers its 21 hand points in the
+  same order MediaPipe does. So the retargeter, depth lifter and multi-camera
+  solver never learn which engine produced a frame (`pose_engines.py` is the
+  only seam).
 - **Multi-camera fusion** (`multicam.py`) runs one of those pipelines per
   device and combines their pose frames with a weighted least squares. Each
   camera contributes its estimate with an information matrix

@@ -4,22 +4,24 @@ Usage:
     python build.py
 
 Output:
-    dist/fpv_pose_tracker-<version>.zip
+    dist/fpv_pose_tracker-<version>.zip  (packaged from src/)
 
 Drop the produced zip on Blender (Edit > Preferences > Add-ons > Install)
 or drag it onto a 3D Viewport (Blender 4.2+).
 """
 
-import ast
-import os
 import re
-import shutil
 import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-SRC = ROOT / "fpv_pose_tracker"
+SRC = ROOT / "src"
 DIST = ROOT / "dist"
+# The folder name inside the zip. Blender imports the addon as a Python
+# package named after this directory, and `bl_idname = __package__` in the
+# preferences depends on it, so it stays fixed whatever the source folder
+# on disk is called.
+PKG = "fpv_pose_tracker"
 
 
 def read_version():
@@ -31,14 +33,24 @@ def read_version():
     return ".".join(parts)
 
 
-def should_include(path: Path) -> bool:
-    parts = set(path.parts)
+def should_include(rel: Path) -> bool:
+    """Decide on a path relative to SRC, not an absolute one.
+
+    An absolute path drags in every parent directory name, so a checkout
+    living under a dotted folder would silently exclude the whole addon.
+    """
+    parts = set(rel.parts)
     if "__pycache__" in parts:
         return False
-    if path.suffix in (".pyc", ".pyo"):
+    # The default clip library lives inside the addon folder, so a
+    # developer who has recorded anything would otherwise ship gigabytes
+    # of their own webcam footage in the release zip.
+    if "clips" in parts:
+        return False
+    if rel.suffix in (".pyc", ".pyo"):
         return False
     # Editor and tooling scratch output that has no business in a release.
-    if any(p.startswith(".") and p not in (".", "..") for p in parts):
+    if any(p.startswith(".") for p in parts):
         return False
     return True
 
@@ -48,16 +60,22 @@ def main():
         raise SystemExit("addon source not found: %s" % SRC)
     DIST.mkdir(exist_ok=True)
     version = read_version()
-    out = DIST / ("fpv_pose_tracker-%s.zip" % version)
+    out = DIST / ("%s-%s.zip" % (PKG, version))
     if out.exists():
         out.unlink()
+    count = 0
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in SRC.rglob("*"):
-            if not path.is_file() or not should_include(path):
+        for path in sorted(SRC.rglob("*")):
+            if not path.is_file():
                 continue
-            rel = path.relative_to(SRC.parent)  # keep top-level pkg folder
-            zf.write(path, rel.as_posix())
-    print("Built:", out)
+            rel = path.relative_to(SRC)
+            if not should_include(rel):
+                continue
+            # Rewrite the source folder's name to the package name Blender
+            # will import it under.
+            zf.write(path, (Path(PKG) / rel).as_posix())
+            count += 1
+    print("Built: %s (%d files)" % (out, count))
 
 
 if __name__ == "__main__":

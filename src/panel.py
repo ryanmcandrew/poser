@@ -3,11 +3,32 @@
 import bpy
 
 from . import dependencies
+from . import pose_engines
+from . import clip_ops
+from . import cliplib
 from . import operators as ops
 from . import recording
 
 
-_PANEL_BUILD = "1.22.0"
+_PANEL_BUILD = "1.26.0"
+
+
+class _Ready:
+    """Common gate for every section panel below the root one.
+
+    OpenCV and numpy are what the whole add-on needs before any of these
+    controls mean anything; the root panel owns that message, so the
+    section panels simply disappear until it is fixed.
+    """
+
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "FPV Pose"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return not dependencies.missing_base_modules()
 
 
 class FPV_PT_main(bpy.types.Panel):
@@ -16,6 +37,7 @@ class FPV_PT_main(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "FPV Pose"
+    bl_order = 0
 
     def draw(self, context):
         layout = self.layout
@@ -25,15 +47,35 @@ class FPV_PT_main(bpy.types.Panel):
 
         _draw_black_frame_warning(layout, s)
 
-        if not dependencies.dependencies_ok():
+        # Only OpenCV and numpy gate the whole panel; which estimator is
+        # installed is the engine block's business, because a user running
+        # RTMPose has no reason to install MediaPipe as well.
+        base_missing = dependencies.missing_base_modules()
+        if base_missing:
             box = layout.box()
-            box.label(text="Missing MediaPipe / OpenCV", icon="ERROR")
+            box.label(text="Missing " + ", ".join(n for n, _ in base_missing),
+                      icon="ERROR")
             box.operator("fpv_pose.install_dependencies", icon="IMPORT")
+            box.operator("fpv_pose.engine_diagnostics", icon="INFO")
             return
 
         col = layout.column(align=True)
         col.prop(s, "armature")
+        col.prop(s, "tracking_mode")
 
+
+class FPV_PT_cameras(_Ready, bpy.types.Panel):
+    """Which devices are used, how they are framed, and how they capture."""
+
+    bl_label = "Cameras"
+    bl_idname = "FPV_PT_cameras"
+    bl_order = 1
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.fpv_pose
+
+        col = layout.column(align=True)
         row = col.row(align=True)
         row.prop(s, "camera_source", text="")
         row.operator("fpv_pose.list_cameras", text="Scan", icon="VIEWZOOM")
@@ -44,61 +86,7 @@ class FPV_PT_main(bpy.types.Panel):
             _draw_multi_cameras(col, s)
 
         col.prop(s, "view_mode")
-        col.prop(s, "tracking_mode")
         col.prop(s, "mirror")
-        col.prop(s, "model_complexity")
-
-        row = col.row(align=True)
-        row.operator("fpv_pose.test_webcam", icon="CAMERA_DATA")
-        row.operator("fpv_pose.reinstall_mediapipe", text="Reinstall MP", icon="FILE_REFRESH")
-
-        if s.test_report:
-            box = layout.box()
-            box.label(text="Test Result:")
-            # Wrap long lines so full error text is readable.
-            for line in s.test_report.splitlines():
-                if not line:
-                    box.separator()
-                    continue
-                chunk = 60
-                for i in range(0, len(line), chunk):
-                    box.label(text=line[i:i + chunk])
-        col.separator()
-        box = col.box()
-        box.label(text="Calibration", icon="ORIENTATION_GIMBAL")
-        box.label(text="Match the rig's rest pose, hold still.")
-        box.label(text="FPS arms: arms forward to camera, palms down.")
-        box.prop(s, "auto_calibrate")
-        row = box.row(align=True)
-        row.prop(s, "calibration_delay")
-        row.prop(s, "calibration_frames")
-        box.prop(s, "reset_pose_on_start")
-        row = box.row(align=True)
-        row.operator("fpv_pose.calibrate", icon="ORIENTATION_GIMBAL")
-        row.operator("fpv_pose.reset_pose", text="Reset Bones", icon="LOOP_BACK")
-        box.operator("fpv_pose.fit_camera", icon="CAMERA_DATA")
-        if s.eye_offset_info:
-            box.label(text=s.eye_offset_info, icon="HIDE_OFF")
-
-        col.separator()
-        box = col.box()
-        box.label(text="Motion Response", icon="FORCE_HARMONIC")
-        row = box.row(align=True)
-        for mode, label in (("SMOOTH", "Smooth"), ("BALANCED", "Balanced"),
-                            ("FAST", "Fast Action")):
-            op = row.operator("fpv_pose.motion_preset", text=label)
-            op.mode = mode
-        box.label(text="Arm settles in %s, hands %s"
-                       % (_ms(s.pose_smoothing), _ms(s.smoothing)),
-                  icon="TIME")
-        if s.pose_smoothing >= 0.85:
-            box.label(text="Too slow for fast action (a punch lasts ~130 ms)",
-                      icon="INFO")
-        box.prop(s, "smoothing", slider=True)
-        box.prop(s, "pose_smoothing", slider=True)
-        col.prop(s, "pose_visibility", slider=True)
-        col.separator()
-        col.prop(s, "pose_source")
         if ops.multi_enabled(s):
             col.label(text="Camera FOV is set per device above", icon="INFO")
         else:
@@ -106,6 +94,28 @@ class FPV_PT_main(bpy.types.Panel):
             if s.camera_fov > 100.0 or s.camera_fov < 45.0:
                 col.label(text="FOV looks unusual; most webcams are 60-78 deg",
                           icon="ERROR")
+
+        _draw_calibration(layout, s)
+        _draw_capture(layout, s)
+
+
+class FPV_PT_engine(_Ready, bpy.types.Panel):
+    """The estimator, and the body geometry its output is read through."""
+
+    bl_label = "Pose Engine + Geometry"
+    bl_idname = "FPV_PT_engine"
+    bl_order = 2
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.fpv_pose
+
+        col = layout.column(align=True)
+        _draw_engine(col, s)
+
+        col.separator()
+        col.prop(s, "pose_visibility", slider=True)
+        col.prop(s, "pose_source")
         if s.pose_source == "LIFT":
             col.prop(s, "hand_depth_from_size")
             if s.hand_depth_from_size:
@@ -123,106 +133,317 @@ class FPV_PT_main(bpy.types.Panel):
         if s.view_mode == "BODY_CAM" or s.pose_source == "WORLD":
             col.prop(s, "pose_y_up")
         col.prop(s, "verbose_hand_log")
+
+        _draw_inference_performance(layout, s)
+
+
+class FPV_PT_motion(_Ready, bpy.types.Panel):
+    """How hard the rig is filtered on its way to the screen."""
+
+    bl_label = "Motion Response"
+    bl_idname = "FPV_PT_motion"
+    bl_order = 3
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.fpv_pose
+
+        row = layout.row(align=True)
+        for mode, label in (("SMOOTH", "Smooth"), ("BALANCED", "Balanced"),
+                            ("FAST", "Fast Action")):
+            op = row.operator("fpv_pose.motion_preset", text=label)
+            op.mode = mode
+        layout.label(text="Arm settles in %s, hands %s"
+                          % (_ms(s.pose_smoothing), _ms(s.smoothing)),
+                     icon="TIME")
+        if s.pose_smoothing >= 0.85:
+            layout.label(text="Too slow for fast action (a punch lasts ~130 ms)",
+                         icon="INFO")
+        col = layout.column(align=True)
+        col.prop(s, "smoothing", slider=True)
+        col.prop(s, "pose_smoothing", slider=True)
+        col.separator()
         col.prop(s, "one_euro_min_cutoff", slider=True)
         col.prop(s, "one_euro_beta", slider=True)
 
-        col.separator()
-        box = col.box()
-        box.label(text="Capture + Performance", icon="CAMERA_DATA")
-        box.label(text="(Stop -> Start to apply)")
-        row = box.row(align=True)
-        row.prop(s, "capture_width")
-        row.prop(s, "capture_height")
-        if 0 < s.capture_width < 320 or 0 < s.capture_height < 240:
-            box.label(text="Tiny capture size; use 0 for the camera default", icon="ERROR")
-        row = box.row(align=True)
-        row.prop(s, "target_fps")
-        row.prop(s, "use_mjpg", toggle=True)
-        row = box.row(align=True)
-        row.prop(s, "exposure_mode", text="")
-        row.operator("fpv_pose.autotune_exposure", text="Auto-Tune", icon="DRIVER")
-        if s.exposure_mode == "MANUAL":
-            sub = box.column(align=True)
-            sub.prop(s, "exposure", slider=True)
-            sub.prop(s, "gain")
-            sub.label(text="Shorter exposure = sharper fast hands. Add light.",
-                      icon="LIGHT_SUN")
-            sub.label(text="Too short gives a black image and no tracking.",
-                      icon="ERROR")
-            sub.operator("fpv_pose.reset_camera", icon="LOOP_BACK")
-        row = box.row(align=True)
-        row.prop(s, "infer_width")
-        row.prop(s, "pose_every")
-        row = box.row(align=True)
-        row.prop(s, "parallel_infer", toggle=True)
-        row.prop(s, "mp_delegate", text="")
-        box.prop(s, "preview_fps", slider=True)
-        if s.cap_info:
-            box.label(text="Camera: " + s.cap_info, icon="CHECKMARK")
-        if s.perf_info:
-            for line in _wrap(s.perf_info, 44):
-                box.label(text=line)
-        box.prop(s, "record_diagnostics")
-        if s.record_diagnostics:
-            box.prop(s, "record_path")
 
-        col.separator()
+class FPV_PT_preview(_Ready, bpy.types.Panel):
+    """Seeing what the camera and the estimator see."""
+
+    bl_label = "Preview + Diagnostics"
+    bl_idname = "FPV_PT_preview"
+    bl_order = 4
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.fpv_pose
+
+        col = layout.column(align=True)
         col.prop(s, "show_preview_window")
         col.prop(s, "show_inline_preview")
         if s.show_inline_preview:
             col.prop(s, "inline_preview_scale", slider=True)
+        col.prop(s, "preview_fps", slider=True)
+
+        row = layout.row(align=True)
+        row.operator("fpv_pose.test_webcam", icon="CAMERA_DATA")
+        row.operator("fpv_pose.reinstall_mediapipe", text="Reinstall MP",
+                     icon="FILE_REFRESH")
+
+        if s.test_report:
+            box = layout.box()
+            box.label(text="Test Result:")
+            # Wrap long lines so full error text is readable.
+            for line in s.test_report.splitlines():
+                if not line:
+                    box.separator()
+                    continue
+                chunk = 60
+                for i in range(0, len(line), chunk):
+                    box.label(text=line[i:i + chunk])
+
+        _draw_inline_preview(layout, s)
+
+
+class FPV_PT_tracking(_Ready, bpy.types.Panel):
+    """Run the tracker, record from it, and watch what it is doing."""
+
+    bl_label = "Tracking"
+    bl_idname = "FPV_PT_tracking"
+    bl_order = 5
+    bl_options = set()          # the panel you actually press buttons in
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.fpv_pose
 
         row = layout.row(align=True)
         row.operator("fpv_pose.start", icon="PLAY")
         row.operator("fpv_pose.stop", icon="PAUSE")
 
         _draw_record_controls(layout, context, s)
+        _draw_status(layout, s)
 
-        # --- diagnostics ---
-        box = layout.box()
-        box.label(text="Status: %s" % s.status)
-        crow = box.row()
-        calibrating = s.calib_status.startswith("calibrating")
-        crow.alert = calibrating or s.calib_status.startswith("partial")
-        crow.label(text="Calibration: %s" % s.calib_status,
-                   icon="TIME" if calibrating else "CHECKMARK")
-        row = box.row(align=True)
-        def _mark(label, ok):
-            r = row.row(align=True)
-            r.alert = not ok
-            r.label(text="%s: %s" % (label, "OK" if ok else "--"))
-        _mark("Pose", s.detect_pose)
-        _mark("L Hand", s.detect_left)
-        _mark("R Hand", s.detect_right)
-        box.label(text="Bones driven: %d   FPS: %.1f" % (s.bones_applied, s.fps))
-        if s.multi_info:
-            for i, line in enumerate(s.multi_info.splitlines()):
-                r = box.row()
-                # A camera contributing almost nothing is the failure mode
-                # that otherwise hides behind a healthy fused frame rate.
-                r.alert = ("FAILED" in line
-                           or any(line.endswith("in %d%% of fused frames" % n)
-                                  for n in range(0, 30)))
-                r.label(text=line,
-                        icon="OUTLINER_OB_CAMERA" if i == 0 else "BLANK1")
 
-        # --- inline preview ---
-        if s.show_inline_preview:
-            img = bpy.data.images.get(ops.PREVIEW_IMAGE_NAME)
-            if img is not None:
-                if not img.preview:
-                    try:
-                        img.preview_ensure()
-                    except Exception:
-                        pass
-                if img.preview and img.preview.icon_id:
-                    row = layout.row()
-                    row.template_icon(icon_value=img.preview.icon_id,
-                                      scale=s.inline_preview_scale)
-                else:
-                    layout.label(text="(preview not available)", icon="INFO")
-            else:
-                layout.label(text="(no preview frame yet)", icon="INFO")
+def _draw_calibration(layout, s):
+    """Rest-pose reference, and framing the camera to match it."""
+    box = layout.box()
+    box.label(text="Calibration", icon="ORIENTATION_GIMBAL")
+    box.label(text="Match the rig's rest pose, hold still.")
+    box.label(text="FPS arms: arms forward to camera, palms down.")
+    box.prop(s, "auto_calibrate")
+    row = box.row(align=True)
+    row.prop(s, "calibration_delay")
+    row.prop(s, "calibration_frames")
+    box.prop(s, "reset_pose_on_start")
+    row = box.row(align=True)
+    row.operator("fpv_pose.calibrate", icon="ORIENTATION_GIMBAL")
+    row.operator("fpv_pose.reset_pose", text="Reset Bones", icon="LOOP_BACK")
+    box.operator("fpv_pose.fit_camera", icon="CAMERA_DATA")
+    if s.eye_offset_info:
+        box.label(text=s.eye_offset_info, icon="HIDE_OFF")
+
+
+def _draw_capture(layout, s):
+    """What the camera is asked to deliver: size, rate, exposure."""
+    box = layout.box()
+    box.label(text="Capture", icon="CAMERA_DATA")
+    box.label(text="(Stop -> Start to apply)")
+    row = box.row(align=True)
+    row.prop(s, "capture_width")
+    row.prop(s, "capture_height")
+    if 0 < s.capture_width < 320 or 0 < s.capture_height < 240:
+        box.label(text="Tiny capture size; use 0 for the camera default",
+                  icon="ERROR")
+    row = box.row(align=True)
+    row.prop(s, "target_fps")
+    row.prop(s, "use_mjpg", toggle=True)
+    row = box.row(align=True)
+    row.prop(s, "exposure_mode", text="")
+    row.operator("fpv_pose.autotune_exposure", text="Auto-Tune", icon="DRIVER")
+    if s.exposure_mode == "MANUAL":
+        sub = box.column(align=True)
+        sub.prop(s, "exposure", slider=True)
+        sub.prop(s, "gain")
+        sub.label(text="Shorter exposure = sharper fast hands. Add light.",
+                  icon="LIGHT_SUN")
+        sub.label(text="Too short gives a black image and no tracking.",
+                  icon="ERROR")
+        sub.operator("fpv_pose.reset_camera", icon="LOOP_BACK")
+    if s.cap_info:
+        box.label(text="Camera: " + s.cap_info, icon="CHECKMARK")
+
+
+def _draw_inference_performance(layout, s):
+    """What the estimator costs per frame, and what it reported back."""
+    box = layout.box()
+    box.label(text="Performance", icon="SORTTIME")
+    box.label(text="(Stop -> Start to apply)")
+    row = box.row(align=True)
+    sub = row.row(align=True)
+    # A top-down engine crops to its own input size, so a pre-shrunk
+    # frame saves it nothing and only blurs the hand crops.
+    sub.enabled = not pose_engines.capabilities(s.pose_engine).wants_full_frame
+    sub.prop(s, "infer_width")
+    row.prop(s, "pose_every")
+    row = box.row(align=True)
+    row.prop(s, "parallel_infer", toggle=True)
+    row.prop(s, "mp_delegate" if s.pose_engine == "MEDIAPIPE"
+             else "engine_device", text="")
+    if s.engine_info:
+        for line in _wrap("Models: " + s.engine_info, 44):
+            box.label(text=line)
+    if s.perf_info:
+        for line in _wrap(s.perf_info, 44):
+            box.label(text=line)
+    if s.angle_info:
+        for line in _wrap("Angles: " + s.angle_info, 44):
+            box.label(text=line, icon="DRIVER_ROTATIONAL_DIFFERENCE")
+    box.prop(s, "record_diagnostics")
+    if s.record_diagnostics:
+        box.prop(s, "record_path")
+
+
+def _draw_status(layout, s):
+    """Live state of the running tracker."""
+    box = layout.box()
+    box.label(text="Status: %s" % s.status)
+    crow = box.row()
+    calibrating = s.calib_status.startswith("calibrating")
+    crow.alert = calibrating or s.calib_status.startswith("partial")
+    crow.label(text="Calibration: %s" % s.calib_status,
+               icon="TIME" if calibrating else "CHECKMARK")
+    row = box.row(align=True)
+
+    def _mark(label, ok):
+        r = row.row(align=True)
+        r.alert = not ok
+        r.label(text="%s: %s" % (label, "OK" if ok else "--"))
+
+    _mark("Pose", s.detect_pose)
+    _mark("L Hand", s.detect_left)
+    _mark("R Hand", s.detect_right)
+    box.label(text="Bones driven: %d   FPS: %.1f" % (s.bones_applied, s.fps))
+    if s.multi_info:
+        for i, line in enumerate(s.multi_info.splitlines()):
+            r = box.row()
+            # A camera contributing almost nothing is the failure mode
+            # that otherwise hides behind a healthy fused frame rate.
+            r.alert = ("FAILED" in line
+                       or any(line.endswith("in %d%% of fused frames" % n)
+                              for n in range(0, 30)))
+            r.label(text=line,
+                    icon="OUTLINER_OB_CAMERA" if i == 0 else "BLANK1")
+
+
+def _draw_inline_preview(layout, s):
+    """The last captured frame, drawn in the sidebar."""
+    if not s.show_inline_preview:
+        return
+    img = bpy.data.images.get(ops.PREVIEW_IMAGE_NAME)
+    if img is None:
+        layout.label(text="(no preview frame yet)", icon="INFO")
+        return
+    if not img.preview:
+        try:
+            img.preview_ensure()
+        except Exception:
+            pass
+    if img.preview and img.preview.icon_id:
+        row = layout.row()
+        row.template_icon(icon_value=img.preview.icon_id,
+                          scale=s.inline_preview_scale)
+    else:
+        layout.label(text="(preview not available)", icon="INFO")
+
+def _draw_engine(layout, s):
+    """Pose-engine picker, and whatever that engine has settings for.
+
+    Only the selected engine's controls are drawn. The alternative --
+    every knob on screen with most of them disabled -- makes a panel that
+    is mostly dead space and invites the user to tune a model that is not
+    running.
+    """
+    caps = pose_engines.capabilities(s.pose_engine)
+    box = layout.box()
+    box.label(text="Pose Engine", icon="ARMATURE_DATA")
+    box.prop(s, "pose_engine", text="")
+
+    ok, dep_msg = dependencies.engine_status(s.pose_engine)
+    if not ok:
+        box.label(text=dep_msg, icon="ERROR")
+        op = box.operator("fpv_pose.install_dependencies", icon="IMPORT",
+                          text="Install %s Dependencies" % caps.label)
+        op.engine = s.pose_engine
+        # Blender hides the per-user site-packages directory, so a wheel
+        # can be installed and still unimportable; Engine Info prints where
+        # each module resolved from and which directories were searched.
+        box.label(text="Installs into Blender's scripts folder", icon="INFO")
+        box.operator("fpv_pose.engine_diagnostics", icon="INFO")
+        return
+    if caps.note:
+        for line in _wrap(caps.note, 44):
+            box.label(text=line, icon="INFO")
+
+    if s.pose_engine == "MEDIAPIPE":
+        box.prop(s, "model_complexity")
+        return
+
+    col = box.column(align=True)
+    col.prop(s, "engine_quality")
+    col.prop(s, "engine_layout")
+    col.prop(s, "engine_hands")
+    resolved = pose_engines.resolve_hand_source(
+        s.pose_engine, s.engine_hands, s.engine_layout)
+    if resolved != s.engine_hands:
+        col.label(text="Using: %s hands" % resolved.lower(), icon="INFO")
+    if resolved == "MEDIAPIPE" and dependencies.missing_modules("MEDIAPIPE"):
+        col.label(text="MediaPipe hands need MediaPipe installed", icon="ERROR")
+    if resolved == "RTM":
+        col.prop(s, "engine_hand_detector", toggle=True)
+    row = col.row(align=True)
+    row.prop(s, "engine_det_every")
+    row.prop(s, "engine_kpt_thr", slider=True)
+
+    if s.engine_device == "CPU":
+        box.operator("fpv_pose.install_gpu_runtime", icon="IMPORT")
+    _draw_body_lengths(box, s, caps)
+    # A 2D engine has no depth of its own, so the lift is not optional and
+    # the near/far decision leans entirely on the hand-size cue.
+    if not caps.world_pose:
+        if s.pose_source != "LIFT":
+            box.label(text="Arm Depth will switch to 2D + Limb Lengths",
+                      icon="ERROR")
+        if not s.hand_depth_from_size:
+            for line in _wrap("No image depth to order joints by: turn on "
+                              "'Hand Size Drives Depth' so a reaching arm "
+                              "reads as reaching.", 44):
+                box.label(text=line, icon="ERROR")
+    box.operator("fpv_pose.engine_diagnostics", icon="INFO")
+
+
+def _draw_body_lengths(layout, s, caps):
+    """Measured limb lengths, which only a 2D engine really depends on.
+
+    MediaPipe learns these from its own 3D pose, so they are an optional
+    override there. RTMPose and ViTPose have no 3D pose to learn from, so
+    leaving them at 0 means the depth lift scales an average body -- which
+    is the one accuracy gap switching engines introduces, and the only one
+    the user has to close by hand.
+    """
+    box = layout.box()
+    box.label(text="Your Measurements (m)", icon="FIXED_SIZE")
+    unset = not (s.body_shoulder_width and s.body_upper_arm and s.body_forearm)
+    if unset and not caps.world_pose:
+        for line in _wrap("Unset: arm depth will scale an average body. "
+                          "Measure these for accurate reach.", 44):
+            box.label(text=line, icon="ERROR")
+    elif unset:
+        box.label(text="0 = learn from the engine's 3D pose", icon="INFO")
+    col = box.column(align=True)
+    col.prop(s, "body_shoulder_width")
+    col.prop(s, "body_upper_arm")
+    col.prop(s, "body_forearm")
 
 
 def _draw_multi_cameras(layout, s):
@@ -552,6 +773,7 @@ class FPV_PT_take_review(_TakeReviewDraw, bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "FPV Pose"
+    bl_order = 6
     bl_options = set()          # open by default: it only shows with a take
 
 
@@ -566,12 +788,306 @@ class FPV_PT_take_review_dopesheet(_TakeReviewDraw, bpy.types.Panel):
     bl_options = set()
 
 
+def _draw_clip_library(layout, context, s):
+    """Where clips live, and which category/subgroup the next one goes in."""
+    box = layout.box()
+    row = box.row(align=True)
+    row.label(text="Library", icon="FILE_FOLDER")
+    row.operator("fpv_pose.clip_scan", text="", icon="FILE_REFRESH")
+    row.operator("fpv_pose.clip_open_folder", text="", icon="FILEBROWSER")
+    box.prop(s, "clip_root", text="")
+    if not s.clip_root.strip():
+        box.label(text="Default: " + cliplib.default_root(), icon="INFO")
+
+    col = box.column(align=True)
+    row = col.row(align=True)
+    row.prop_search(s, "clip_category", context.scene, "fpv_clip_categories",
+                    text="Category", icon="OUTLINER_COLLECTION")
+    row = col.row(align=True)
+    row.prop_search(s, "clip_subgroup", context.scene, "fpv_clip_groups",
+                    text="Subgroup", icon="OUTLINER_COLLECTION")
+    col.prop(s, "clip_show_all", toggle=True)
+    if not s.clip_category:
+        col.label(text="No category: clips land in the library root",
+                  icon="INFO")
+
+
+def _draw_clip_record(layout, context, s):
+    """Capture raw footage. No estimator runs here, on purpose."""
+    box = layout.box()
+    box.label(text="Record Clip", icon="REC")
+    recording_now = bool(s.clip_rec_active)
+
+    col = box.column(align=True)
+    col.enabled = not recording_now
+    col.prop(s, "clip_name")
+    row = col.row(align=True)
+    row.prop(s, "clip_countdown")
+    row.prop(s, "clip_max_seconds")
+
+    row = box.row(align=True)
+    row.scale_y = 1.3
+    if recording_now:
+        row.alert = True
+        row.operator("fpv_pose.clip_record_stop", icon="SNAP_FACE")
+    else:
+        row.operator("fpv_pose.clip_record_start", icon="REC")
+    if ops._STATE.get("tracker") is not None:
+        box.label(text="Live tracking holds the camera — stop it first",
+                  icon="ERROR")
+    if recording_now:
+        box.label(text="%d frames  %.1fs" % (s.clip_rec_frames, s.clip_rec_seconds),
+                  icon="RADIOBUT_ON")
+    if s.clip_rec_status:
+        for line in _wrap(s.clip_rec_status, 44):
+            box.label(text=line)
+    box.label(text="Resolution, frame rate and exposure come from "
+                   "Capture + Performance", icon="INFO")
+
+
+def _draw_clip_list(layout, context, s):
+    scene = context.scene
+    layout.template_list("FPV_UL_clips", "", scene, "fpv_clips",
+                         s, "clip_active_index", rows=4)
+    clip = clip_ops.active_clip(scene)
+    if clip is None:
+        layout.label(text="No clips here yet — record one, or Refresh",
+                     icon="INFO")
+        return None
+    col = layout.column(align=True)
+    col.label(text="%d frames  %.4g fps  %.1fs  %.0f MB"
+                   % (clip.frames, clip.fps, clip.duration, clip.size_mb))
+    if clip.category:
+        col.label(text="In %s%s" % (clip.category,
+                                    "/" + clip.subgroup if clip.subgroup else ""))
+    row = col.row(align=True)
+    row.operator("fpv_pose.clip_open_video", icon="PLAY")
+    row.operator("fpv_pose.clip_delete", icon="TRASH")
+    return clip
+
+
+def _draw_clip_analysis(layout, context, s):
+    """Run an estimator over the clip, and say what it will cost."""
+    box = layout.box()
+    box.label(text="Pose Estimation", icon="ARMATURE_DATA")
+    col = box.column(align=True)
+    col.prop(s, "clip_engine", text="")
+    ok, msg = dependencies.engine_status(s.clip_engine)
+    if not ok:
+        sub = col.column(align=True)
+        sub.alert = True
+        sub.label(text=msg, icon="ERROR")
+        op = sub.operator("fpv_pose.install_dependencies", icon="IMPORT")
+        op.engine = s.clip_engine
+    caps = pose_engines.capabilities(s.clip_engine)
+    if caps.note:
+        for line in _wrap(caps.note, 44):
+            col.label(text=line, icon="INFO")
+    if s.clip_engine == "MEDIAPIPE":
+        col.prop(s, "model_complexity")
+    else:
+        row = col.row(align=True)
+        row.prop(s, "clip_quality", text="")
+        row.prop(s, "clip_device", text="")
+        col.prop(s, "engine_layout", text="")
+        col.prop(s, "engine_hands", text="")
+        # Worth saying where the palm angle comes from: these engines
+        # return hand keypoints in pixels with no depth, so the palm
+        # plane is reconstructed from the shape of the knuckles rather
+        # than measured, and it is less certain than MediaPipe's.
+        for line in _wrap("Hands from this engine are 2D; palm tilt is "
+                          "fitted from the knuckle shape", 44):
+            col.label(text=line, icon="INFO")
+    col.prop(s, "clip_stride")
+    col.prop(s, "clip_overwrite")
+
+    row = box.row(align=True)
+    row.scale_y = 1.2
+    if s.clip_analysis_active:
+        row.operator("fpv_pose.clip_analyze_cancel", icon="X")
+        box.label(text="%.0f%%  %s" % (100.0 * s.clip_analysis_progress,
+                                       s.clip_analysis_status),
+                  icon="TIME")
+    else:
+        row.operator("fpv_pose.clip_analyze", icon="PLAY")
+        if s.clip_analysis_status:
+            for line in _wrap(s.clip_analysis_status, 44):
+                box.label(text=line)
+
+
+def _draw_clip_preview(layout, context, s):
+    """The estimated pose drawn over the footage, frame by frame."""
+    box = layout.box()
+    box.label(text="Result Preview", icon="SEQ_PREVIEW")
+    box.prop(s, "clip_analysis", text="")
+    engine, sidecar = clip_ops.selected_analysis(s)
+    if sidecar is None:
+        box.label(text="Analyse the clip to get a result to preview",
+                  icon="INFO")
+        return
+
+    row = box.row(align=True)
+    row.operator("fpv_pose.clip_preview_open", icon="HIDE_OFF")
+    row.operator("fpv_pose.clip_preview_close", text="", icon="X")
+    row.operator("fpv_pose.clip_delete_analysis", text="", icon="TRASH")
+
+    length = clip_ops.preview_length(s)
+    if not length:
+        return
+    col = box.column(align=True)
+    sub = col.row(align=True)
+    for label, icon, target in (("", "REW", "FIRST"),
+                                ("", "TRIA_LEFT", "PREV"),
+                                ("", "TRIA_RIGHT", "NEXT"),
+                                ("", "FF", "LAST")):
+        op = sub.operator("fpv_pose.clip_preview_step", text=label, icon=icon)
+        op.target = target
+    op = sub.operator("fpv_pose.clip_preview_step", text="Next Gap",
+                      icon="TRACKING_CLEAR_FORWARDS")
+    op.target = "NEXT_LOST"
+    # No slider: the clip length is not known to the property, and a
+    # slider without a real maximum is worse than a drag field.
+    col.prop(s, "clip_preview_frame")
+    row = col.row(align=True)
+    row.prop(s, "clip_preview_pose", toggle=True)
+    row.prop(s, "clip_preview_hands", toggle=True)
+    col.prop(s, "clip_preview_scale", slider=True)
+    if s.clip_preview_info:
+        for line in _wrap(s.clip_preview_info, 44):
+            box.label(text=line)
+
+    img = bpy.data.images.get(clip_ops.CLIP_PREVIEW_IMAGE)
+    if img is None:
+        return
+    if not img.preview:
+        try:
+            img.preview_ensure()
+        except Exception:
+            pass
+    if img.preview and img.preview.icon_id:
+        row = box.row()
+        row.template_icon(icon_value=img.preview.icon_id,
+                          scale=s.clip_preview_scale)
+
+
+def _draw_clip_calibration(layout, context, s):
+    """Where the rest-pose reference comes from.
+
+    This gets its own box because it is the difference between a clip
+    replay that matches the performance and one whose wrists are rotated
+    off somewhere: the hand bones are driven by the change in palm
+    orientation *since* a reference, and a clip cannot be asked to hold
+    still after the fact.
+    """
+    box = layout.box()
+    box.label(text="Calibration", icon="OUTLINER_OB_EMPTY")
+    box.prop(s, "clip_calib_source", text="")
+
+    if s.clip_calib_source == "PROFILE":
+        row = box.row(align=True)
+        row.prop(s, "clip_calib_profile", text="")
+        row.operator("fpv_pose.clip_calib_delete", text="", icon="TRASH")
+        if s.clip_calib_profile in ("", "NONE"):
+            box.label(text="Record a few seconds of the rig's rest pose, "
+                           "analyse it, then Calibrate from Clip", icon="INFO")
+    elif s.clip_calib_source == "LIVE":
+        if ops.live_calibration() is None:
+            box.label(text="No live calibration yet — track once and "
+                           "calibrate", icon="ERROR")
+        else:
+            box.label(text="Using the live session's calibration",
+                      icon="CHECKMARK")
+    else:
+        box.label(text="Only correct if this clip opens on the rest pose",
+                  icon="ERROR")
+
+    col = box.column(align=True)
+    col.operator("fpv_pose.clip_record_calibration", icon="REC")
+    col.label(text="Then analyse it and make a profile from it:")
+    row = col.row(align=True)
+    row.prop(s, "clip_calib_skip")
+    row.prop(s, "clip_calib_hold")
+    col.prop(s, "clip_calib_name")
+    row = col.row(align=True)
+    row.operator("fpv_pose.clip_calibrate", icon="OUTLINER_OB_ARMATURE")
+    row.operator("fpv_pose.clip_calib_from_live", icon="REC")
+    if s.clip_calib_status:
+        box.label(text=s.clip_calib_status, icon="INFO")
+
+
+def _draw_clip_apply(layout, context, s):
+    """Put an analysed clip on the rig, and play it back."""
+    box = layout.box()
+    box.label(text="Drive the Rig", icon="ARMATURE_DATA")
+    if s.armature is None:
+        box.label(text="Pick an armature above", icon="ERROR")
+    if recording.is_live():
+        r = box.row()
+        r.alert = True
+        r.label(text="Stop live tracking before replaying a clip", icon="ERROR")
+    if recording.has_take():
+        box.label(text="Save or discard the current take first", icon="INFO")
+    if s.clip_calib_source == "PROFILE" and s.clip_calib_profile in ("", "NONE"):
+        r = box.row()
+        r.alert = True
+        r.label(text="No calibration profile — see Calibration above",
+                icon="ERROR")
+    elif s.clip_calib_source == "LIVE" and ops.live_calibration() is None:
+        r = box.row()
+        r.alert = True
+        r.label(text="No live calibration to reuse", icon="ERROR")
+    box.prop(s, "clip_apply_action")
+    row = box.row(align=True)
+    row.scale_y = 1.3
+    row.operator("fpv_pose.clip_apply", icon="PLAY")
+    row = box.row(align=True)
+    row.operator("fpv_pose.clip_play", icon="PLAY_SOUND")
+    box.label(text="Replays through the same retargeter as live tracking, "
+                   "with no camera running", icon="INFO")
+
+
+class FPV_PT_clips(bpy.types.Panel):
+    """Record footage, estimate pose over it offline, and drive the rig
+    from the result -- the whole path that does not need tracking mode."""
+
+    bl_label = "Clip Library + Offline Pose"
+    bl_idname = "FPV_PT_clips"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "FPV Pose"
+    bl_order = 7
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.fpv_pose
+
+        base_missing = dependencies.missing_base_modules()
+        if base_missing:
+            box = layout.box()
+            box.label(text="Missing " + ", ".join(n for n, _ in base_missing),
+                      icon="ERROR")
+            box.operator("fpv_pose.install_dependencies", icon="IMPORT")
+            return
+
+        _draw_clip_library(layout, context, s)
+        _draw_clip_record(layout, context, s)
+        clip = _draw_clip_list(layout, context, s)
+        if clip is None:
+            return
+        _draw_clip_analysis(layout, context, s)
+        _draw_clip_preview(layout, context, s)
+        _draw_clip_calibration(layout, context, s)
+        _draw_clip_apply(layout, context, s)
+
+
 class FPV_PT_bones(bpy.types.Panel):
     bl_label = "Bone Map"
     bl_idname = "FPV_PT_bones"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "FPV Pose"
+    bl_order = 8
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
@@ -619,8 +1135,10 @@ class FPV_PT_bones(bpy.types.Panel):
                     bone_row(sub, slot, f"  Joint {i}")
 
 
-_CLASSES = (FPV_UL_take_frames, FPV_PT_main, FPV_PT_take_review,
-            FPV_PT_take_review_dopesheet, FPV_PT_bones)
+_CLASSES = (FPV_UL_take_frames, FPV_PT_main, FPV_PT_cameras,
+            FPV_PT_engine, FPV_PT_motion, FPV_PT_preview,
+            FPV_PT_tracking, FPV_PT_take_review,
+            FPV_PT_take_review_dopesheet, FPV_PT_clips, FPV_PT_bones)
 
 
 def register():

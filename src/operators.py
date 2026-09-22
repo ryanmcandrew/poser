@@ -3,6 +3,7 @@
 import bpy
 
 from . import dependencies
+from . import pose_engines
 from . import mapping
 from . import multicam as multicam_mod
 from . import properties as props_mod
@@ -16,6 +17,10 @@ _STATE = {
     "retargeter": None,
     "timer": None,
     "last_frame_t": None,
+    # Kept after the tracker is gone: a calibration measured live is the
+    # readiest reference for priming a clip replay, which has no moment
+    # at which the performer can be asked to hold the rest pose.
+    "last_calibration": None,
 }
 
 PREVIEW_IMAGE_NAME = "FPV_Preview"
@@ -102,16 +107,98 @@ def _camera_specs(s):
 
 class FPV_OT_install_dependencies(bpy.types.Operator):
     bl_idname = "fpv_pose.install_dependencies"
-    bl_label = "Install Dependencies (OpenCV + MediaPipe)"
+    bl_label = "Install Dependencies"
+    bl_description = ("Install the wheels the selected pose engine needs into "
+                      "Blender's bundled Python")
+
+    engine: bpy.props.StringProperty(default="")
 
     def execute(self, context):
-        ok, log = dependencies.install_dependencies()
+        engine = self.engine or None
+        if engine is None:
+            scene = getattr(context, "scene", None)
+            engine = getattr(scene and scene.fpv_pose, "pose_engine", None)
+        ok, log = dependencies.install_dependencies(engine)
         print("[FPV Pose Tracker] install log:\n" + log)
+        scene = getattr(context, "scene", None)
+        if scene is not None:
+            # The tail of the log, in the panel: pip's own words are the
+            # only useful thing to read when an install goes wrong, and the
+            # system console is not where anyone looks first.
+            scene.fpv_pose.test_report = log[-2000:]
         if ok:
-            self.report({"INFO"}, "Dependencies installed. Restart Blender if imports still fail.")
+            # No restart needed: install_dependencies puts the target
+            # directory on sys.path and re-verifies the imports before
+            # claiming success.
+            self.report({"INFO"},
+                        "Installed into %s and verified importable."
+                        % dependencies.lib_dir())
         else:
-            self.report({"ERROR"}, "Install failed. See system console.")
+            self.report({"ERROR"}, "Install failed. See the log in the panel.")
         return {"FINISHED"} if ok else {"CANCELLED"}
+
+
+class FPV_OT_install_gpu_runtime(bpy.types.Operator):
+    bl_idname = "fpv_pose.install_gpu_runtime"
+    bl_label = "Install GPU Runtime"
+    bl_description = ("Replace onnxruntime with onnxruntime-gpu so the "
+                      "RTMPose/ViTPose engines can use CUDA. Needs an NVIDIA "
+                      "GPU with a matching CUDA/cuDNN install; the CPU "
+                      "provider keeps working either way")
+
+    def execute(self, context):
+        s = context.scene.fpv_pose
+        pkg = dependencies.GPU_PIP.get(s.pose_engine)
+        if not pkg:
+            self.report({"WARNING"},
+                        "The %s engine has no separate GPU wheel" % s.pose_engine)
+            return {"CANCELLED"}
+        ok, log = dependencies.install_dependencies(packages=[pkg])
+        print("[FPV Pose Tracker] gpu runtime install log:\n" + log)
+        s.test_report = log[-2000:]
+        if ok:
+            self.report({"INFO"}, "%s installed — restart Blender, then set "
+                                  "Compute to GPU" % pkg)
+        else:
+            self.report({"ERROR"}, "Install failed. See panel / system console.")
+        return {"FINISHED"} if ok else {"CANCELLED"}
+
+
+class FPV_OT_engine_diagnostics(bpy.types.Operator):
+    bl_idname = "fpv_pose.engine_diagnostics"
+    bl_label = "Engine Info"
+    bl_description = ("Report what every pose engine's dependencies look like "
+                      "in this Blender's Python, without opening the camera")
+
+    def execute(self, context):
+        s = context.scene.fpv_pose
+        lines = []
+        for eng in pose_engines.ENGINES:
+            ok, msg = dependencies.engine_status(eng)
+            lines.append("%-10s %-22s %s" % (
+                eng, pose_engines.capabilities(eng).label,
+                "OK" if ok else msg))
+        lines.append("")
+        # Where each module resolved from, and where they are searched for.
+        # A wheel can be on disk and still invisible to Blender, which is
+        # the one dependency failure that looks like nothing at all.
+        lines.append("--- import paths ---")
+        lines.append(dependencies.path_report())
+        seen = []
+        for eng in pose_engines.ENGINES:
+            for import_name, _ in pose_engines.required_modules(eng):
+                if import_name in seen:
+                    continue
+                seen.append(import_name)
+                origin = dependencies.module_origin(import_name)
+                lines.append("  %-14s %s" % (import_name,
+                                             origin or "not importable"))
+        lines.append("")
+        lines.append(pose_engines.diagnostics())
+        s.test_report = "\n".join(lines)
+        print("[FPV Pose Tracker] engine diagnostics:\n" + s.test_report)
+        self.report({"INFO"}, "Engine report in the panel")
+        return {"FINISHED"}
 
 
 class FPV_OT_auto_map(bpy.types.Operator):
@@ -185,20 +272,29 @@ class FPV_OT_reinstall_mediapipe(bpy.types.Operator):
 
 class FPV_OT_test_webcam(bpy.types.Operator):
     bl_idname = "fpv_pose.test_webcam"
-    bl_label = "Test Webcam + MediaPipe"
-    bl_description = ("Synchronously open the webcam, grab one frame, run "
-                      "MediaPipe on it, and print what was detected")
+    bl_label = "Test Webcam + Engine"
+    bl_description = ("Synchronously open the webcam, grab one frame, run the "
+                      "selected pose engine on it, and print what was "
+                      "detected")
 
     def execute(self, context):
         s = context.scene.fpv_pose
-        if not dependencies.dependencies_ok():
-            s.test_report = "MediaPipe/OpenCV not installed"
+        ok_deps, dep_msg = dependencies.engine_status(s.pose_engine)
+        if not ok_deps:
+            s.test_report = "%s engine not installed (%s)" % (s.pose_engine,
+                                                              dep_msg)
             self.report({"ERROR"}, s.test_report)
             return {"CANCELLED"}
         ok, report = tracker_mod.test_webcam(
             camera_index=active_camera_index(s),
             tracking_mode=s.tracking_mode,
             mirror=bool(s.mirror),
+            pose_engine=s.pose_engine,
+            engine_quality=s.engine_quality,
+            engine_layout=s.engine_layout,
+            engine_hands=s.engine_hands,
+            engine_device=s.engine_device,
+            engine_kpt_thr=float(s.engine_kpt_thr),
         )
         s.test_report = report
         print("[FPV Pose Tracker] test_webcam report:\n" + report)
@@ -241,7 +337,9 @@ class FPV_OT_reset_camera(bpy.types.Operator):
         if _STATE.get("tracker") is not None:
             self.report({"ERROR"}, "Stop tracking first — the camera is in use")
             return {"CANCELLED"}
-        if not dependencies.dependencies_ok():
+        # Camera-only work: OpenCV is the whole requirement, so it must not
+        # be blocked by a pose engine the user is not running.
+        if dependencies.missing_base_modules():
             self.report({"ERROR"}, "OpenCV is not installed")
             return {"CANCELLED"}
         try:
@@ -271,7 +369,9 @@ class FPV_OT_autotune_exposure(bpy.types.Operator):
 
     def execute(self, context):
         s = context.scene.fpv_pose
-        if not dependencies.dependencies_ok():
+        # Camera-only work: OpenCV is the whole requirement, so it must not
+        # be blocked by a pose engine the user is not running.
+        if dependencies.missing_base_modules():
             self.report({"ERROR"}, "OpenCV is not installed")
             return {"CANCELLED"}
         try:
@@ -319,21 +419,68 @@ def _current_bone_map(scene):
     return {slot: getattr(b, slot, "") for slot in mapping.BONE_SLOTS}
 
 
-def _update_preview_image(rgba_np):
+def current_bone_map(scene):
+    """Public alias: the clip operators build the same map for replay."""
+    return _current_bone_map(scene)
+
+
+def build_retargeter(scene, armature=None, vis_thr=None):
+    """A Retargeter configured from the scene settings.
+
+    Live tracking and clip replay have to solve the rig identically -- the
+    whole promise of an offline take is that it is the same result with
+    better landmarks -- so both come through here rather than each
+    spelling out thirty keyword arguments.
+    """
+    s = scene.fpv_pose
+    armature = armature if armature is not None else s.armature
+    return retarget_mod.Retargeter(
+        armature, _current_bone_map(scene),
+        smoothing=float(s.smoothing),
+        pose_smoothing=float(s.pose_smoothing),
+        pose_visibility=float(s.pose_visibility if vis_thr is None else vis_thr),
+        view_mode=s.view_mode,
+        one_euro_min_cutoff=float(s.one_euro_min_cutoff),
+        one_euro_beta=float(s.one_euro_beta),
+        use_arm_ik=bool(s.use_arm_ik),
+        freeze_shoulder=bool(s.freeze_shoulder),
+        shoulder_mode=s.shoulder_mode,
+        shoulder_protract=float(s.shoulder_protract),
+        track_palm=bool(s.track_palm),
+        anchor_mode=s.anchor_mode,
+        elbow_from_angle=bool(s.elbow_from_angle),
+        auto_calibrate=bool(s.auto_calibrate),
+        calibration_delay=float(s.calibration_delay),
+        calibration_frames=int(s.calibration_frames),
+        hand_depth_mode=s.hand_depth_mode,
+        pose_source=s.pose_source,
+        verbose_hand_log=bool(s.verbose_hand_log),
+        body_shoulder=float(s.body_shoulder_width),
+        body_upper=float(s.body_upper_arm),
+        body_fore=float(s.body_forearm),
+    )
+
+
+def _update_preview_image(rgba_np, name=PREVIEW_IMAGE_NAME):
     """Push the annotated frame into a Blender Image datablock and refresh
-    its preview so panel drawing shows the latest frame."""
+    its preview so panel drawing shows the latest frame.
+
+    `name` keeps the live tracker and the clip previewer in separate
+    datablocks: they can be on screen at once, and sharing one would make
+    each overwrite the other every frame.
+    """
     try:
         h, w, _ = rgba_np.shape
     except Exception:
         return
-    img = bpy.data.images.get(PREVIEW_IMAGE_NAME)
+    img = bpy.data.images.get(name)
     if img is None or img.size[0] != w or img.size[1] != h:
         if img is not None:
             try:
                 bpy.data.images.remove(img)
             except Exception:
                 pass
-        img = bpy.data.images.new(PREVIEW_IMAGE_NAME, w, h, alpha=True)
+        img = bpy.data.images.new(name, w, h, alpha=True)
     # Blender images store pixels bottom-up; MediaPipe/OpenCV frames are
     # top-down. Flip vertically here.
     try:
@@ -441,6 +588,11 @@ def _timer_tick():
                            tm.get("total", 0.0), tm.get("grab", 0.0),
                            tm.get("hands", 0.0), tm.get("pose", 0.0),
                            tm.get("overlay", 0.0), int(tm.get("dropped", 0))))
+        if not s.engine_info and hasattr(tr, "engine_info"):
+            s.engine_info = tr.engine_info()
+        ang = getattr(frame, "joint_angles", None)
+        if ang is not None:
+            s.angle_info = ang.summary()
         if not s.cap_info:
             s.cap_info = tr.cap_info()
             s.cap_warning = tr.cap_warning()
@@ -501,6 +653,11 @@ def _finish_take(scene):
     return tk
 
 
+def finish_take(scene):
+    """Public alias: a clip replay ends its take the same way live does."""
+    return _finish_take(scene)
+
+
 def _detect(scene):
     s = scene.fpv_pose
     tk = recording.take()
@@ -518,10 +675,32 @@ def _detect(scene):
     return flagged, dropped
 
 
+def live_calibration():
+    """The calibration from the live session, current or last, or None.
+
+    Calibrating live is the one case that works without any setup: the
+    performer is at the camera and can be asked to hold the rest pose. So
+    it is worth keeping the result after the tracker is gone -- it is the
+    cheapest way to prime a clip replay, which has no such moment.
+    """
+    rt = _STATE.get("retargeter")
+    if rt is not None:
+        data = rt.export_calibration()
+        if data:
+            return data
+    return _STATE.get("last_calibration")
+
+
 def _stop_internal():
     tr = _STATE.get("tracker")
     if tr is not None:
         tr.stop()
+    rt = _STATE.get("retargeter")
+    if rt is not None:
+        try:
+            _STATE["last_calibration"] = rt.export_calibration()
+        except Exception:
+            pass
     _STATE["tracker"] = None
     _STATE["retargeter"] = None
     _STATE["last_frame_t"] = None
@@ -575,9 +754,37 @@ class FPV_OT_start(bpy.types.Operator):
         if _STATE.get("tracker") is not None:
             self.report({"WARNING"}, "Already tracking")
             return {"CANCELLED"}
-        if not dependencies.dependencies_ok():
+        ok_deps, dep_msg = dependencies.engine_status(s.pose_engine)
+        if not ok_deps:
             self.report({"ERROR"},
-                        "Missing MediaPipe/OpenCV. Use 'Install Dependencies' first.")
+                        "%s engine cannot run (%s). Use 'Install Dependencies' "
+                        "first." % (s.pose_engine, dep_msg))
+            return {"CANCELLED"}
+        # A ROI hand model needs a body pose to place its crops, and the
+        # MediaPipe hand pairing needs MediaPipe itself.
+        hand_src = pose_engines.resolve_hand_source(
+            s.pose_engine, s.engine_hands, s.engine_layout)
+        if hand_src == "MEDIAPIPE" and s.pose_engine != "MEDIAPIPE" \
+                and dependencies.missing_modules("MEDIAPIPE"):
+            self.report({"ERROR"},
+                        "Hand Source is MediaPipe Hands but MediaPipe is not "
+                        "installed. Install it, or pick another hand source.")
+            return {"CANCELLED"}
+        if hand_src == "RTM" and s.tracking_mode == "HANDS" \
+                and not s.engine_hand_detector:
+            # The ROI hand model gets its crops from the body pose, and
+            # Hands Only never runs one, so without the fallback detector
+            # there is nothing to tell it where to look.
+            self.report({"ERROR"},
+                        "Hands Only with the ROI hand model needs 'Hand "
+                        "Fallback Detector' on — there is no body pose to "
+                        "place the hand crops.")
+            return {"CANCELLED"}
+        if hand_src == "WHOLEBODY" and s.tracking_mode == "HANDS":
+            self.report({"ERROR"},
+                        "Hand Source 'From Body Model' needs the body model "
+                        "to run — use Body + Hands, or pick another hand "
+                        "source.")
             return {"CANCELLED"}
         if not s.armature:
             self.report({"ERROR"}, "Pick an armature")
@@ -617,7 +824,28 @@ class FPV_OT_start(bpy.types.Operator):
             pose_every=int(s.pose_every),
             parallel_infer=bool(s.parallel_infer),
             delegate=s.mp_delegate,
+            pose_engine=s.pose_engine,
+            engine_quality=s.engine_quality,
+            engine_layout=s.engine_layout,
+            engine_hands=s.engine_hands,
+            engine_device=s.engine_device,
+            engine_det_every=int(s.engine_det_every),
+            engine_kpt_thr=float(s.engine_kpt_thr),
+            engine_hand_detector=bool(s.engine_hand_detector),
+            body_shoulder=float(s.body_shoulder_width),
+            body_upper=float(s.body_upper_arm),
+            body_fore=float(s.body_forearm),
         )
+        caps = pose_engines.capabilities(s.pose_engine)
+        if not caps.world_pose and s.pose_source == "WORLD":
+            # The engine has no world pose to read, so the depth lift is the
+            # only source of 3D there is. Switching it here rather than
+            # refusing to start keeps a saved MediaPipe-era scene working.
+            s.pose_source = "LIFT"
+            self.report({"WARNING"},
+                        "%s is a 2D engine — Arm Depth switched to "
+                        "'2D + Limb Lengths'" % s.pose_engine)
+        common["lift_depth"] = (s.pose_source == "LIFT")
         preview_fps = float(s.preview_fps) if (s.show_preview_window
                                                or s.show_inline_preview) else 0.0
         record_path = _record_path(s) if s.record_diagnostics else None
@@ -666,28 +894,7 @@ class FPV_OT_start(bpy.types.Operator):
         narrowest = min([float(d.fov) for d in enabled_cameras(s)] or [180.0])             if multi_enabled(s) else float(s.camera_fov)
         if narrowest < 50.0:
             vis_thr = min(0.9, vis_thr + 0.15)
-        rt = retarget_mod.Retargeter(
-            s.armature, bone_map,
-            smoothing=float(s.smoothing),
-            pose_smoothing=float(s.pose_smoothing),
-            pose_visibility=vis_thr,
-            view_mode=s.view_mode,
-            one_euro_min_cutoff=float(s.one_euro_min_cutoff),
-            one_euro_beta=float(s.one_euro_beta),
-            use_arm_ik=bool(s.use_arm_ik),
-            freeze_shoulder=bool(s.freeze_shoulder),
-            shoulder_mode=s.shoulder_mode,
-            shoulder_protract=float(s.shoulder_protract),
-            track_palm=bool(s.track_palm),
-            anchor_mode=s.anchor_mode,
-            elbow_from_angle=bool(s.elbow_from_angle),
-            auto_calibrate=bool(s.auto_calibrate),
-            calibration_delay=float(s.calibration_delay),
-            calibration_frames=int(s.calibration_frames),
-            hand_depth_mode=s.hand_depth_mode,
-            pose_source=s.pose_source,
-            verbose_hand_log=bool(s.verbose_hand_log),
-        )
+        rt = build_retargeter(context.scene, s.armature, vis_thr)
         # A preview action would be evaluated on top of every tick, so put
         # the rig back under the tracker's control before it starts.
         recording.clear_preview(s.armature)
@@ -701,6 +908,8 @@ class FPV_OT_start(bpy.types.Operator):
         _STATE["last_frame_t"] = None
         s.cap_info = ""
         s.perf_info = ""
+        s.engine_info = ""
+        s.angle_info = ""
         s.cap_warning = ""
         s.cap_brightness = -1.0
         bpy.app.timers.register(_timer_tick, first_interval=0.1)
@@ -1484,6 +1693,8 @@ class FPV_OT_take_discard(bpy.types.Operator):
 
 _CLASSES = (
     FPV_OT_install_dependencies,
+    FPV_OT_install_gpu_runtime,
+    FPV_OT_engine_diagnostics,
     FPV_OT_reinstall_mediapipe,
     FPV_OT_auto_map,
     FPV_OT_clear_map,

@@ -151,6 +151,112 @@ def _camera_source_update(self, context):
         ensure_camera_slots(self, 2)
 
 
+# ----------------------------------------------------------------------
+# clip library
+# ----------------------------------------------------------------------
+
+def _clip_dirs_update(self, context):
+    """Category or subgroup changed: re-list what is in that folder."""
+    if _MUTE["on"]:
+        return
+    try:
+        from . import clip_ops
+        clip_ops.refresh_clip_list(context)
+    except Exception as e:
+        print("[FPV Pose Tracker] clip rescan failed:", e)
+
+
+def _clip_select_update(self, context):
+    """A different clip is active: its analyses and preview follow it."""
+    if _MUTE["on"]:
+        return
+    try:
+        from . import clip_ops
+        clip_ops.clip_selection_changed(context)
+    except Exception as e:
+        print("[FPV Pose Tracker] clip selection failed:", e)
+
+
+def _clip_preview_update(self, context):
+    if _MUTE["on"]:
+        return
+    try:
+        from . import clip_ops
+        clip_ops.refresh_clip_preview(context)
+    except Exception as e:
+        print("[FPV Pose Tracker] clip preview failed:", e)
+
+
+# Blender keeps no reference to the strings an EnumProperty callback
+# returns, so a list built inline is freed while the menu still points at
+# it and the UI draws garbage. Holding the last result fixes that.
+_ANALYSIS_ITEMS = []
+
+
+def _analysis_items(self, context):
+    """Which analyses exist for the selected clip."""
+    from . import cliplib
+    _ANALYSIS_ITEMS.clear()
+    path = (self.clip_selected_path or "").strip()
+    if path:
+        for engine, sidecar in cliplib.list_analyses(path):
+            header = cliplib.read_header(sidecar)
+            detail = "%s, %d frames" % (header.get("quality", "?"),
+                                        int(header.get("frames", 0)))
+            rate = header.get("detect_rate")
+            if rate is not None:
+                detail += ", %.0f%% detected" % (100.0 * rate)
+            _ANALYSIS_ITEMS.append((engine, "%s (%s)" % (engine, detail), detail))
+    if not _ANALYSIS_ITEMS:
+        _ANALYSIS_ITEMS.append(("NONE", "No analysis yet",
+                                "Run Analyze Clip to estimate pose over this clip"))
+    return _ANALYSIS_ITEMS
+
+
+# Same lifetime trap as `_ANALYSIS_ITEMS`: the list has to outlive the
+# call that builds it.
+_PROFILE_ITEMS = []
+
+
+def _profile_items(self, context):
+    """Calibration profiles saved in the current library."""
+    from . import cliplib
+    _PROFILE_ITEMS.clear()
+    try:
+        root = cliplib.resolve_root(self.clip_root)
+        for name in cliplib.list_profiles(root):
+            data = cliplib.read_profile(root, name) or {}
+            detail = data.get("source") or "saved calibration"
+            _PROFILE_ITEMS.append((name, name, detail))
+    except Exception as e:
+        print("[FPV Pose Tracker] cannot list calibration profiles:", e)
+    if not _PROFILE_ITEMS:
+        _PROFILE_ITEMS.append(
+            ("NONE", "No profile saved",
+             "Record a clip of the rig's rest pose, analyse it, then press "
+             "Calibrate from Clip"))
+    return _PROFILE_ITEMS
+
+
+class FPVNameItem(PropertyGroup):
+    """A folder name, mirrored into the scene so prop_search can offer it."""
+
+
+class FPVClipItem(PropertyGroup):
+    """One recorded clip in the library, as the UI list needs it."""
+
+    path: StringProperty()
+    label: StringProperty()
+    category: StringProperty()
+    subgroup: StringProperty()
+    frames: IntProperty()
+    fps: FloatProperty()
+    duration: FloatProperty()
+    size_mb: FloatProperty()
+    analyses: StringProperty(
+        description="Engines this clip has already been analysed with")
+
+
 class FPVCameraDevice(PropertyGroup):
     """One webcam in a multi-camera rig."""
 
@@ -327,10 +433,158 @@ class FPVPoseSettings(PropertyGroup):
         name="Mirror Webcam", default=True,
         description="Flip the feed horizontally. Keep ON for Selfie mode (the rig's left follows your left) and OFF for Body Cam mode. Pose/hand left-right labels are corrected automatically for either setting.",
     )
+    pose_engine: EnumProperty(
+        name="Pose Engine",
+        items=[
+            ("MEDIAPIPE", "MediaPipe Holistic",
+             "33-point pose plus 21-point hands, with MediaPipe's own metric "
+             "3D pose. By far the fastest and the only engine here that "
+             "reports depth itself, but the least accurate on shoulders, "
+             "elbows and wrists."),
+            ("RTMPOSE", "RTMPose (accurate, real-time)",
+             "Top-down RTMPose over ONNX Runtime: a person detector, then a "
+             "body model, then a dedicated hand model on crops the body "
+             "found. Markedly better arm and torso landmarks at close to "
+             "MediaPipe's frame rate. 2D only, so arm depth comes from the "
+             "depth lifter. Needs rtmlib + onnxruntime."),
+            ("VITPOSE", "ViTPose (most accurate, slowest)",
+             "The same top-down stack with a Vision Transformer body "
+             "backbone — the most accurate body landmarks available here, "
+             "and the heaviest. Sensible with a CUDA GPU; expect well under "
+             "real time on CPU. Needs rtmlib + onnxruntime."),
+        ],
+        default="MEDIAPIPE",
+        description="Which pose estimation system drives the rig. Changing "
+                    "this requires Stop -> Start; models download on first use.",
+    )
     model_complexity: IntProperty(
         name="Model Complexity", default=1, min=0, max=2,
-        description="Pose model: 0 = lite (fastest), 1 = full, 2 = heavy (most accurate landmarks, slowest). Changing this requires Stop -> Start; the model downloads on first use.",
+        description="MediaPipe pose model: 0 = lite (fastest), 1 = full, 2 = heavy (most accurate landmarks, slowest). Changing this requires Stop -> Start; the model downloads on first use.",
     )
+    engine_quality: EnumProperty(
+        name="Quality",
+        items=[
+            ("LITE", "Lite", "Smallest body model and detector (RTMPose-s / "
+                             "ViTPose-s, YOLOX-tiny). Fastest, and still "
+                             "ahead of MediaPipe on arm landmarks."),
+            ("BALANCED", "Balanced", "RTMPose-m / ViTPose-b with YOLOX-m. The "
+                                     "recommended setting."),
+            ("ACCURATE", "Accurate", "RTMPose-x at 384x288 / ViTPose-l with "
+                                     "YOLOX-x. Best landmarks, several times "
+                                     "the cost."),
+        ],
+        default="BALANCED",
+        description="Model size for the RTMPose/ViTPose engines. Changing "
+                    "this requires Stop -> Start.",
+    )
+    engine_layout: EnumProperty(
+        name="Keypoints",
+        items=[
+            ("BODY", "Body (17)", "COCO-17: head, shoulders, elbows, wrists, "
+                                  "hips, knees, ankles. Everything the arm "
+                                  "retargeter uses, at the lowest cost."),
+            ("FEET", "Body + Feet (26)", "Adds heels and toes, which a "
+                                         "standing full-body rig wants. "
+                                         "Halpe-26 / COCO-25."),
+            ("WHOLEBODY", "Whole Body (133)",
+             "Body, feet, face and both hands from one model (RTMW / "
+             "ViTPose-wholebody). The hands come out of the body pass for "
+             "free, but at body resolution — less precise than the dedicated "
+             "hand model."),
+        ],
+        default="BODY",
+        description="Which keypoint set the body model predicts. Changing "
+                    "this requires Stop -> Start.",
+    )
+    engine_hands: EnumProperty(
+        name="Hand Source",
+        items=[
+            ("AUTO", "Auto", "Use the body model's own hand points when it "
+                             "has them (Whole Body), otherwise the dedicated "
+                             "RTMPose hand model."),
+            ("RTM", "RTMPose Hand (ROI)",
+             "A 21-point hand model run on a high-resolution crop around "
+             "each wrist, using the body pose to place the crop. The best "
+             "option for fingers, and the architecture MediaPipe's Holistic "
+             "uses internally."),
+            ("WHOLEBODY", "From Body Model",
+             "Take the hand points out of a 133-keypoint body result. Free, "
+             "but limited by the body crop's resolution. Falls back to the "
+             "ROI hand model if the body model is not Whole Body."),
+            ("MEDIAPIPE", "MediaPipe Hands",
+             "Pair an RTMPose/ViTPose body with MediaPipe's hand landmarker, "
+             "which is fast and supplies metric hand geometry the depth "
+             "estimate can use. Needs MediaPipe installed as well."),
+        ],
+        default="AUTO",
+        description="Where finger landmarks come from when the engine is not "
+                    "MediaPipe. Changing this requires Stop -> Start.",
+    )
+    engine_device: EnumProperty(
+        name="Compute",
+        items=[
+            ("CPU", "CPU", "Always available."),
+            ("GPU", "GPU (CUDA)", "Use the CUDA execution provider, falling "
+                                  "back to CPU if onnxruntime-gpu is not "
+                                  "installed. Several times faster, and close "
+                                  "to required for ViTPose."),
+            ("MPS", "GPU (Apple)", "Use the CoreML execution provider on "
+                                   "Apple silicon, falling back to CPU."),
+        ],
+        default="CPU",
+        description="Execution provider for the ONNX engines. Changing this "
+                    "requires Stop -> Start.",
+    )
+    engine_det_every: IntProperty(
+        name="Detect Every",
+        default=6, min=1, max=60,
+        description="Run the person detector every N frames; in between, the "
+                    "person box is tracked forward from the previous frame's "
+                    "keypoints. The detector is the expensive half of a "
+                    "top-down stack and a webcam subject does not teleport, "
+                    "so 5-10 costs almost nothing in accuracy. 1 detects "
+                    "every frame.",
+    )
+    engine_kpt_thr: FloatProperty(
+        name="Keypoint Threshold",
+        default=0.3, min=0.0, max=1.0,
+        description="Keypoints scoring below this are reported as unseen "
+                    "rather than driving a bone. Raise it if the rig twitches "
+                    "toward guessed joints, lower it to keep partly occluded "
+                    "arms alive.",
+    )
+    engine_hand_detector: BoolProperty(
+        name="Hand Fallback Detector",
+        default=True,
+        description="Also load RTMPose's own hand detector, used when no body "
+                    "pose is available to place the hand crops (Hands Only "
+                    "mode, or the subject not found). Costs one more model in "
+                    "memory.",
+    )
+    body_shoulder_width: FloatProperty(
+        name="Shoulder Width",
+        default=0.0, min=0.0, max=1.0, subtype="DISTANCE",
+        description="Your shoulder-to-shoulder width in metres, used to scale "
+                    "the depth lift. 0 = learn it from the engine's 3D pose, "
+                    "which only MediaPipe provides — with RTMPose or ViTPose "
+                    "an unset value falls back to an average body, so measure "
+                    "yourself here for accurate arm depth. Changing this "
+                    "requires Stop -> Start.",
+    )
+    body_upper_arm: FloatProperty(
+        name="Upper Arm",
+        default=0.0, min=0.0, max=1.0, subtype="DISTANCE",
+        description="Shoulder-to-elbow length in metres. 0 = learn or assume. "
+                    "Changing this requires Stop -> Start.",
+    )
+    body_forearm: FloatProperty(
+        name="Forearm",
+        default=0.0, min=0.0, max=1.0, subtype="DISTANCE",
+        description="Elbow-to-wrist length in metres. 0 = learn or assume. "
+                    "Changing this requires Stop -> Start.",
+    )
+    engine_info: StringProperty(default="")
+    angle_info: StringProperty(default="")
     tracking_mode: EnumProperty(
         name="Tracking Mode",
         items=[
@@ -766,6 +1020,217 @@ class FPVPoseSettings(PropertyGroup):
     eye_offset_info: StringProperty(default="")
     cap_brightness: FloatProperty(default=-1.0)
 
+    # --- clip library ------------------------------------------------
+    clip_root: StringProperty(
+        name="Library",
+        subtype="DIR_PATH",
+        default="",
+        description="Folder that holds recorded clips, as "
+                    "<library>/<category>/<subgroup>/<clip>.mp4. Leave it "
+                    "blank to keep them in the clips folder inside the addon",
+    )
+    clip_category: StringProperty(
+        name="Category",
+        default="",
+        update=_clip_dirs_update,
+        description="Top-level grouping, for example punches. A folder of "
+                    "this name is created under the library when you record",
+    )
+    clip_subgroup: StringProperty(
+        name="Subgroup",
+        default="",
+        update=_clip_dirs_update,
+        description="Optional second level inside the category, for example "
+                    "jab. Leave blank to record straight into the category",
+    )
+    clip_show_all: BoolProperty(
+        name="Whole Library",
+        default=False,
+        update=_clip_dirs_update,
+        description="List every clip in the library instead of only the ones "
+                    "in the selected category and subgroup",
+    )
+    clip_active_index: IntProperty(
+        default=0,
+        update=_clip_select_update,
+        description="Selected clip",
+    )
+    clip_selected_path: StringProperty(default="")
+
+    # --- clip recording ----------------------------------------------
+    clip_name: StringProperty(
+        name="Clip Name",
+        default="take",
+        description="Base name for the next recording. A number is appended "
+                    "rather than overwriting footage you cannot re-shoot",
+    )
+    clip_countdown: IntProperty(
+        name="Countdown",
+        default=3, min=0, max=15,
+        description="Seconds of preview before recording starts, to get into "
+                    "position and away from the keyboard",
+    )
+    clip_max_seconds: IntProperty(
+        name="Max Length",
+        default=120, min=0, max=3600,
+        description="Stop automatically after this many seconds. 0 = no "
+                    "limit; raw video runs roughly 5-20 MB per second",
+    )
+    clip_rec_active: BoolProperty(default=False)
+    clip_rec_frames: IntProperty(default=0)
+    clip_rec_seconds: FloatProperty(default=0.0)
+    clip_rec_status: StringProperty(default="")
+
+    # --- offline analysis --------------------------------------------
+    clip_engine: EnumProperty(
+        name="Engine",
+        items=[
+            ("MEDIAPIPE", "MediaPipe Holistic",
+             "Fastest, and the only engine with its own metric 3D pose. "
+             "Least accurate on shoulders, elbows and wrists."),
+            ("RTMPOSE", "RTMPose (ONNX)",
+             "Markedly better arm and torso landmarks. 2D only, so arm depth "
+             "comes from the depth lifter. Needs rtmlib + onnxruntime."),
+            ("VITPOSE", "ViTPose (ONNX)",
+             "The most accurate body landmarks available here and the "
+             "slowest, which offline is a price worth paying because nothing "
+             "is waiting on the frame. Needs rtmlib + onnxruntime."),
+        ],
+        default="RTMPOSE",
+        description="Estimator to run over the recorded clip. Each engine "
+                    "writes its own result beside the clip, so several can "
+                    "be compared on the same footage",
+    )
+    clip_quality: EnumProperty(
+        name="Quality",
+        items=[
+            ("LITE", "Lite", "Smallest models. Rarely the right choice "
+                             "offline."),
+            ("BALANCED", "Balanced", "The live default."),
+            ("ACCURATE", "Accurate", "Largest models. Several times the cost "
+                                     "per frame, and the reason to analyse "
+                                     "offline at all."),
+        ],
+        default="ACCURATE",
+        description="Model size for the RTMPose and ViTPose engines",
+    )
+    clip_device: EnumProperty(
+        name="Compute",
+        items=[
+            ("CPU", "CPU", "Always available."),
+            ("GPU", "GPU (CUDA)", "Use the CUDA execution provider, falling "
+                                  "back to CPU if onnxruntime-gpu is not "
+                                  "installed."),
+            ("MPS", "GPU (Apple)", "Use the CoreML execution provider on "
+                                   "Apple silicon, falling back to CPU."),
+        ],
+        default="CPU",
+        description="Execution provider for the ONNX engines",
+    )
+    clip_stride: IntProperty(
+        name="Every Nth Frame",
+        default=1, min=1, max=10,
+        description="Analyse every Nth frame only. 1 is the point of an "
+                    "offline pass; raise it to trade temporal detail for "
+                    "time on a long clip and a slow engine",
+    )
+    clip_overwrite: BoolProperty(
+        name="Replace Existing",
+        default=True,
+        description="Overwrite this engine's previous analysis of the clip. "
+                    "Untick to refuse rather than discard a long run",
+    )
+    clip_analysis_active: BoolProperty(default=False)
+    clip_analysis_progress: FloatProperty(default=0.0, min=0.0, max=1.0)
+    clip_analysis_status: StringProperty(default="")
+
+    # --- analysis preview ---------------------------------------------
+    clip_analysis: EnumProperty(
+        name="Result",
+        items=_analysis_items,
+        description="Which analysis of this clip to preview and apply",
+    )
+    clip_preview_frame: IntProperty(
+        name="Frame",
+        default=0, min=0,
+        update=_clip_preview_update,
+        description="Frame of the analysed clip to show, with its estimated "
+                    "pose drawn over the footage",
+    )
+    clip_preview_scale: FloatProperty(
+        name="Preview Size",
+        default=8.0, min=1.0, max=30.0,
+        description="On-screen size of the preview image",
+    )
+    clip_preview_pose: BoolProperty(
+        name="Body",
+        default=True,
+        update=_clip_preview_update,
+        description="Draw the body landmarks over the frame",
+    )
+    clip_preview_hands: BoolProperty(
+        name="Hands",
+        default=True,
+        update=_clip_preview_update,
+        description="Draw the hand landmarks over the frame",
+    )
+    clip_preview_info: StringProperty(default="")
+
+    # --- calibration --------------------------------------------------
+    clip_calib_source: EnumProperty(
+        name="Calibration",
+        items=[
+            ("PROFILE", "Saved Profile",
+             "Use a calibration recorded once from a clip of the rest pose. "
+             "The reliable option: the reference is a pose you posed for, "
+             "not whatever the take happens to open on"),
+            ("LIVE", "Live Session",
+             "Reuse the calibration from the current or last live tracking "
+             "session in this Blender session"),
+            ("CLIP", "This Clip's Opening",
+             "Sample the reference from the first seconds of this clip. Only "
+             "right when the clip itself opens on the rig's rest pose"),
+        ],
+        default="PROFILE",
+        description="Where the rest-pose reference comes from when this clip "
+                    "is replayed onto the rig. Palm direction and wrist "
+                    "orientation are driven by the change since that "
+                    "reference, so a wrong one rotates every wrist in the take",
+    )
+    clip_calib_profile: EnumProperty(
+        name="Profile",
+        items=_profile_items,
+        description="Which saved calibration to prime the rig with",
+    )
+    clip_calib_name: StringProperty(
+        name="Save As",
+        default="default",
+        description="Name to save the calibration under, in the library's "
+                    "_calibration folder. One per performer and camera setup",
+    )
+    clip_calib_skip: FloatProperty(
+        name="Skip",
+        default=0.5, min=0.0, max=30.0, subtype="TIME_ABSOLUTE", unit="TIME",
+        description="Seconds to ignore at the start of a calibration clip, "
+                    "before the performer has settled into the rest pose",
+    )
+    clip_calib_hold: FloatProperty(
+        name="Hold",
+        default=3.0, min=0.0, max=60.0, subtype="TIME_ABSOLUTE", unit="TIME",
+        description="Seconds of the calibration clip to sample from. 0 uses "
+                    "the whole clip",
+    )
+    clip_calib_status: StringProperty(default="")
+
+    # --- applying to the rig ------------------------------------------
+    clip_apply_action: BoolProperty(
+        name="Bake Straight to an Action",
+        default=False,
+        description="Bake the replayed clip to an Action immediately instead "
+                    "of leaving it in Take Review. Untick to trim it and drop "
+                    "bad frames first, which recorded footage usually wants",
+    )
+
     bones: PointerProperty(type=FPVBoneMap)
 
     # runtime status (updated by the timer tick)
@@ -783,7 +1248,8 @@ class FPVPoseSettings(PropertyGroup):
     take_present: BoolProperty(default=False)
 
 
-_CLASSES = (FPVTakeFrame, FPVBoneMap, FPVCameraDevice, FPVPoseSettings)
+_CLASSES = (FPVTakeFrame, FPVBoneMap, FPVCameraDevice, FPVNameItem,
+            FPVClipItem, FPVPoseSettings)
 
 
 def register():
@@ -791,6 +1257,9 @@ def register():
         bpy.utils.register_class(c)
     bpy.types.Scene.fpv_pose = PointerProperty(type=FPVPoseSettings)
     bpy.types.Scene.fpv_take_frames = CollectionProperty(type=FPVTakeFrame)
+    bpy.types.Scene.fpv_clips = CollectionProperty(type=FPVClipItem)
+    bpy.types.Scene.fpv_clip_categories = CollectionProperty(type=FPVNameItem)
+    bpy.types.Scene.fpv_clip_groups = CollectionProperty(type=FPVNameItem)
 
 
 def unregister():
@@ -798,6 +1267,9 @@ def unregister():
         del bpy.types.Scene.fpv_pose
     if hasattr(bpy.types.Scene, "fpv_take_frames"):
         del bpy.types.Scene.fpv_take_frames
+    for attr in ("fpv_clips", "fpv_clip_categories", "fpv_clip_groups"):
+        if hasattr(bpy.types.Scene, attr):
+            delattr(bpy.types.Scene, attr)
     for c in reversed(_CLASSES):
         try:
             bpy.utils.unregister_class(c)

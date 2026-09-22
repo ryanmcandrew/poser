@@ -254,6 +254,19 @@ class MultiCamTracker:
                     out[k] = max(out.get(k, 0.0), v)
         return out
 
+    def engine_info(self):
+        """The models one unit loaded.
+
+        Every camera runs the same engine with the same settings, so
+        listing it once per camera would only repeat itself; what differs
+        between units is the capture, and `cap_info` already covers that.
+        """
+        for unit in self._units:
+            info = unit.engine_info()
+            if info:
+                return "%s (x%d cameras)" % (info, len(self._units))
+        return ""
+
     def cap_info(self):
         parts = []
         for spec, unit in zip(self.specs, self._units):

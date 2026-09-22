@@ -98,6 +98,10 @@ _Z = Vector((0.0, 0.0, 1.0))
 # the shoulder stops looking janky when the hands move away.
 _CLAVICLE_REACH_MARGIN = 0.95
 
+# Bumped when the contents of an exported calibration change shape, so
+# a profile written by an older addon is refused rather than misread.
+CALIBRATION_VERSION = 1
+
 _SMOOTH_REF_DT = 1.0 / 30.0
 # Clamp so a stall or a burst cannot turn into a wild filter weight.
 _DT_MIN = 1.0 / 240.0
@@ -161,6 +165,24 @@ def _sign(v):
 def _cols(x, y, z):
     """3x3 matrix with the given column vectors."""
     return Matrix((x, y, z)).transposed()
+
+
+def _mat_to_list(m):
+    """3x3 -> nested lists of plain floats, or None."""
+    if m is None:
+        return None
+    return [[round(float(m[r][c]), 6) for c in range(3)] for r in range(3)]
+
+
+def _mat_from_list(rows):
+    """The inverse of `_mat_to_list`, tolerant of junk from a hand-edited
+    profile: anything that is not a 3x3 of numbers comes back as None."""
+    try:
+        if not rows or len(rows) != 3:
+            return None
+        return Matrix([[float(v) for v in row] for row in rows])
+    except (TypeError, ValueError):
+        return None
 
 
 def _gram_schmidt(a, b, c):
@@ -277,8 +299,16 @@ class Retargeter:
                  anchor_mode="AUTO", elbow_from_angle=True,
                  auto_calibrate=True, calibration_delay=3.0,
                  calibration_frames=15, hand_depth_mode="AUTO",
-                 pose_source="LIFT", verbose_hand_log=False):
+                 pose_source="LIFT", verbose_hand_log=False,
+                 body_shoulder=0.0, body_upper=0.0, body_fore=0.0):
         self.armature = armature_obj
+        # The user's own measurements, in metres, or 0 for "work it out".
+        # The running estimates below are read off the engine's metric
+        # world pose, which only MediaPipe reports, so for a 2D engine
+        # these are the only real proportions available and the whole rig
+        # would otherwise be scaled to a population average.
+        self._fixed_shoulder = float(body_shoulder or 0.0)
+        self._fixed_reach = float(body_upper or 0.0) + float(body_fore or 0.0)
         self.bone_map = dict(bone_map)
         self.smoothing = max(0.0, min(0.99, smoothing))
         self.pose_smoothing = max(0.0, min(0.99, pose_smoothing))
@@ -351,6 +381,7 @@ class Retargeter:
         self._hand_depth_sign = 1.0
         if self.hand_depth_mode == "FLIPPED":
             self._hand_depth_sign = -1.0
+        self._calib_pose_basis = None
         self._calib_request_time = None
         self._calib_torso = []
         self._calib_hand = {"L": [], "R": []}
@@ -483,6 +514,123 @@ class Retargeter:
             self._hand_depth_sign = 1.0
         self._calib_status_text = "calibrating: get into the rig's rest pose"
 
+    def set_calibration_origin(self, t):
+        """Re-anchor an open calibration window onto another clock.
+
+        The window is timed against `PoseFrame.timestamp`, which is the
+        wall clock for a live camera but seconds-from-start for a recorded
+        clip. Replaying a clip without moving the origin leaves the delay
+        permanently unexpired, so calibration never finishes and no bone is
+        ever driven.
+        """
+        if self._calib_request_time is not None:
+            self._calib_request_time = float(t)
+
+    def cancel_calibration(self):
+        """Close the calibration window without sampling anything.
+
+        Used when the calibration has come from somewhere else (a stored
+        profile, a calibration clip, a live session): the window would
+        otherwise overwrite it from the first frames of the performance,
+        which is exactly the reference we are trying not to use.
+        """
+        self._calib_request_time = None
+        self._calib_torso = []
+        self._calib_hand = {"L": [], "R": []}
+
+    def finalize_partial_calibration(self, min_samples=3):
+        """Accept whatever has been sampled so far. Returns what it took.
+
+        `calibration_frames` is sized for a live hold, where frames are
+        free and the user is standing there. A calibration clip is short
+        on purpose, and a two-second hold that happens to be a few frames
+        under the quota is a perfectly good reference -- throwing it away
+        and reporting nothing would be the wrong trade.
+        """
+        taken = []
+        if (self._torso_calibration_needed() and self._M_pose is None
+                and len(self._calib_torso) >= min_samples):
+            self._finalize_torso()
+            taken.append("torso")
+        for side in ("L", "R"):
+            if (self._hand_cal[side] is None
+                    and len(self._calib_hand[side]) >= min_samples):
+                self._finalize_hand(side)
+                taken.append("hand " + side)
+        return taken
+
+    def calibration_complete(self):
+        """True when nothing is left to sample: torso (if this mode needs
+        it) and both hands have a reference."""
+        torso_ok = (not self._torso_calibration_needed()) or self._M_pose is not None
+        return torso_ok and all(self._hand_cal[s] is not None for s in ("L", "R"))
+
+    def export_calibration(self):
+        """A JSON-safe snapshot of what calibration produced, or None.
+
+        Only the *reference* poses are stored -- the performer's torso
+        basis and each palm basis, all in tracker space. Nothing here
+        mentions the rig, so a calibration recorded once can prime any
+        armature; `load_calibration` re-pairs it with the rig it lands on.
+        """
+        # `_M_pose` is not evidence: in body-cam view it is set to the rig
+        # basis at construction, so testing it would export a profile that
+        # measured nothing and quietly prime every later clip with it.
+        if not any((self._calib_pose_basis is not None,
+                    self._hand_cal["L"] is not None,
+                    self._hand_cal["R"] is not None)):
+            return None
+        return {
+            "version": CALIBRATION_VERSION,
+            "created": time.time(),
+            "view_mode": self.view_mode,
+            "pose_source": self.pose_source,
+            "hand_depth_sign": float(self._hand_depth_sign),
+            "pose_basis": _mat_to_list(self._calib_pose_basis),
+            "hand_L": _mat_to_list(self._hand_cal["L"]),
+            "hand_R": _mat_to_list(self._hand_cal["R"]),
+            "status": self._calib_status_text,
+        }
+
+    def load_calibration(self, data):
+        """Adopt a stored calibration. Returns a short status string.
+
+        The torso part is re-solved against *this* rig from the stored
+        performer basis, so a profile made against one armature still
+        means "the performer faced this way" on another.
+        """
+        if not data:
+            return "no calibration data"
+        if int(data.get("version", 0)) != CALIBRATION_VERSION:
+            return "calibration profile is from another version"
+        self.cancel_calibration()
+        loaded = []
+        basis = _mat_from_list(data.get("pose_basis"))
+        if basis is not None:
+            self._calib_pose_basis = basis
+            self._M_pose = self._F_rig @ basis.inverted()
+            loaded.append("torso")
+        elif not self._torso_calibration_needed():
+            self._M_pose = self._F_rig.copy()
+        for side in ("L", "R"):
+            m = _mat_from_list(data.get("hand_" + side))
+            if m is not None:
+                self._hand_cal[side] = _orthonormalize_basis(m)
+                loaded.append("hand " + side)
+        if self.hand_depth_mode == "AUTO":
+            self._hand_depth_sign = float(data.get("hand_depth_sign", 1.0) or 1.0)
+        if not loaded:
+            self._calib_status_text = "calibration profile was empty"
+            return self._calib_status_text
+        note = ""
+        if data.get("view_mode") and data["view_mode"] != self.view_mode:
+            # Worth saying out loud: the two view modes put the performer
+            # in different places relative to the camera, so a profile
+            # from the other one is a guess, not a measurement.
+            note = " (recorded in %s view)" % data["view_mode"]
+        self._calib_status_text = "loaded calibration: " + ", ".join(loaded) + note
+        return self._calib_status_text
+
     def _torso_calibration_needed(self):
         return self.view_mode == "SELFIE" and self.pose_source == "WORLD"
 
@@ -600,12 +748,17 @@ class Retargeter:
         self._eye_samples.append((local.z / width, local.y / width))
 
     def _user_reach(self):
-        # Foreshortening only ever shortens MediaPipe's limb estimate, so a
+        # A stated measurement beats an inferred one, so it wins outright.
+        if self._fixed_reach > 0.25:
+            return self._fixed_reach
+        # Foreshortening only ever shortens a learned limb estimate, so a
         # high percentile is closer to the true length than the median.
         m = _percentile(self._reach_samples, 0.8)
         return m if (m is not None and m > 0.25) else _DEFAULT_USER_REACH
 
     def _user_shoulder_half(self):
+        if self._fixed_shoulder > 0.15:
+            return 0.5 * self._fixed_shoulder
         m = _percentile(self._shoulder_samples, 0.5)
         return 0.5 * m if (m is not None and m > 0.15) else 0.5 * _DEFAULT_USER_SHOULDER
 
@@ -744,6 +897,10 @@ class Retargeter:
             source = "cross-product (assumes right-handed pose frame)"
 
         F_user = _gram_schmidt(rights, forward, up)
+        # Kept as well as the product, because a stored calibration has to
+        # survive being loaded onto a rig with different rest geometry:
+        # F_user describes the performer, _M_pose describes the pairing.
+        self._calib_pose_basis = F_user.copy()
         self._M_pose = self._F_rig @ F_user.inverted()
         det = self._M_pose.determinant()
         print("[FPV Pose Tracker] torso calibrated from %d frames (forward from %s). "
@@ -802,7 +959,11 @@ class Retargeter:
         left alone (user is getting into / holding the rest pose)."""
         if self._calib_request_time is None:
             return False
-        now = pf.timestamp if pf.timestamp else time.time()
+        # `is not None`, not truthiness: a clip's first frame is at t=0.0
+        # exactly, and falling back to the wall clock there makes the
+        # window look hours old, so it gives up on frame one and the take
+        # is driven with no calibration at all.
+        now = pf.timestamp if pf.timestamp is not None else time.time()
         elapsed = now - self._calib_request_time
         if elapsed < self.calibration_delay:
             self._calib_status_text = "calibrating: hold the rig's rest pose (%d)" % int(
